@@ -1,0 +1,152 @@
+{
+  "name": "argus-ai-observability",
+  "displayName": "Argus Eli - AI Agent Observability",
+  "description": "Monitor, track, and analyze all AI agent interactions. One-click setup for Claude Code, Gemini CLI, Gemini Code Assist, Cursor, and OpenAI.",
+  "version": "0.20.0",
+  "publisher": "IlanMindel",
+  "icon": "icon.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Machine Learning",
+    "Visualization"
+  ],
+  "keywords": [
+    "AI",
+    "Claude",
+    "observability",
+    "monitoring",
+    "LLM",
+    "agent",
+    "tokens",
+    "cost tracking",
+    "Gemini",
+    "Google",
+    "Gemini CLI"
+  ],
+  "activationEvents": [
+    "*"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "argus.connect",
+        "title": "Argus: Connect to Server"
+      },
+      {
+        "command": "argus.disconnect",
+        "title": "Argus: Disconnect"
+      },
+      {
+        "command": "argus.openDashboard",
+        "title": "Argus: Open Dashboard"
+      },
+      {
+        "command": "argus.showStatus",
+        "title": "Argus: Show Status"
+      },
+      {
+        "command": "argus.showCopilotLog",
+        "title": "Argus: Show Copilot Debug Log"
+      },
+      {
+        "command": "argus.testCopilotCapture",
+        "title": "Argus: Test Copilot Capture (send test event)"
+      },
+      {
+        "command": "argus.copilotStatus",
+        "title": "Argus: Show Copilot Capture Status"
+      },
+      {
+        "command": "argus.probeLmTransport",
+        "title": "Argus: Probe LM Transport (diagnose Copilot routing)"
+      }
+    ],
+    "configuration": {
+      "title": "Argus AI Observability",
+      "properties": {
+        "argus.serverUrl": {
+          "type": "string",
+          "default": "http://54.196.154.205:4080",
+          "description": "URL of the Argus server"
+        },
+        "argus.autoConnect": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically connect to Argus server on startup"
+        },
+        "argus.showStatusBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show Argus status in the status bar"
+        },
+        "argus.enableGeminiCli": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically configure Gemini CLI hooks when connecting"
+        },
+        "argus.enableGeminiCodeAssist": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable proxy-based observability for Gemini Code Assist"
+        },
+        "argus.enableCopilot": {
+          "type": "boolean",
+          "default": true,
+          "description": "Capture GitHub Copilot prompts and completions for observability"
+        },
+        "argus.copilotDebugMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Log all intercepted HTTPS hostnames for 60 seconds to diagnose Copilot capture issues"
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "argus",
+          "title": "Argus",
+          "icon": "$(eye)"
+        }
+      ]
+    },
+    "views": {
+      "argus": [
+        {
+          "id": "argus.status",
+          "name": "Status"
+        },
+        {
+          "id": "argus.sessions",
+          "name": "Active Sessions"
+        },
+        {
+          "id": "argus.spending",
+          "name": "Spending"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.7.0",
+    "@vscode/vsce": "^2.22.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ArgusX-AI/argus-vscode-extension"
+  },
+  "license": "MIT"
+}

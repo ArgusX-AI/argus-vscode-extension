@@ -1,0 +1,11 @@
+.git/
+.gitignore
+node_modules/
+src/
+scripts/
+docs/
+icons/
+*.ts
+tsconfig.json
+.vscode/
+**/*.map
