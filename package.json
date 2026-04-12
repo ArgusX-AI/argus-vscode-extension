@@ -2,7 +2,7 @@
   "name": "argus-ai-observability",
   "displayName": "Argus Eli - AI Agent Observability",
   "description": "Monitor, track, and analyze all AI agent interactions. One-click setup for Claude Code, Gemini CLI, Gemini Code Assist, Cursor, and OpenAI.",
-  "version": "0.20.0",
+  "version": "0.23.0",
   "publisher": "IlanMindel",
   "icon": "icon.png",
   "engines": {
@@ -41,6 +41,10 @@
         "title": "Argus: Disconnect"
       },
       {
+        "command": "argus.resetLocalProxyConfig",
+        "title": "Argus: Reset Local Claude / Provider Proxy Config"
+      },
+      {
         "command": "argus.openDashboard",
         "title": "Argus: Open Dashboard"
       },
@@ -51,6 +55,10 @@
       {
         "command": "argus.showCopilotLog",
         "title": "Argus: Show Copilot Debug Log"
+      },
+      {
+        "command": "argus.openOtelDebugFolder",
+        "title": "Argus: Open OTEL Debug Folder (Desktop)"
       },
       {
         "command": "argus.testCopilotCapture",
@@ -70,7 +78,7 @@
       "properties": {
         "argus.serverUrl": {
           "type": "string",
-          "default": "http://54.196.154.205:4080",
+          "default": "",
           "description": "URL of the Argus server"
         },
         "argus.autoConnect": {
@@ -102,6 +110,16 @@
           "type": "boolean",
           "default": false,
           "description": "Log all intercepted HTTPS hostnames for 60 seconds to diagnose Copilot capture issues"
+        },
+        "argus.enableCodex": {
+          "type": "boolean",
+          "default": true,
+          "description": "Capture OpenAI Codex sessions for observability"
+        },
+        "argus.codexDebugMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable verbose logging for Codex capture debugging"
         }
       }
     },
@@ -146,7 +164,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/ArgusX-AI/argus-vscode-extension"
+    "url": "https://github.com/ArgusX-AI/Argus-v2"
   },
   "license": "MIT"
 }

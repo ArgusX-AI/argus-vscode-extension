@@ -2,7 +2,8 @@ import * as vscode from 'vscode';
 import * as http from 'http';
 import * as https from 'https';
 import { URL } from 'url';
-import { configureClaudeHooks, configureClaudeEnvVar } from './claude-setup';
+import { configureClaudeHooks, configureClaudeEnvVar, removeClaudeHooksForServer } from './claude-setup';
+import { argusEnvVarMatches, normalizeArgusBaseUrl, removeEnvVarPersistent } from './env-utils';
 import { configureGeminiCliHooks, configureGeminiEnvVar } from './gemini-setup';
 import { detectGeminiCodeAssist } from './gemini-code-assist';
 import { setupCopilotCapture, teardownCopilotCapture } from './copilot-setup';
@@ -10,7 +11,9 @@ import { getInterceptStats, sendTestEvent } from './copilot-intercept';
 import { getDiagnosticsStats, probeLmApiTransport } from './copilot-diagnostics';
 import { startLmMonitor, stopLmMonitor, getLmStatus } from './copilot-lm-monitor';
 import { getLmInterceptStats } from './copilot-lm-intercept';
-import { getOtelStats } from './copilot-otel';
+import { getOtelStats, PREFERRED_OTLP_PORT } from './copilot-otel';
+import { setupCodexCapture, teardownCodexCapture } from './codex-setup';
+import { getCodexOtelStats, CODEX_OTLP_PORT } from './codex-otel';
 
 function httpRequest(urlStr: string, options: { timeout?: number } = {}): Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }> {
   return new Promise((resolve, reject) => {
@@ -38,16 +41,67 @@ let statusBarItem: vscode.StatusBarItem;
 let connected = false;
 let connectionInProgress = false;
 let outputChannel: vscode.OutputChannel;
+const DEFAULT_SERVER_URL = '';
+
+async function teardownArgusProviderEnv(serverUrl: string, log: (msg: string) => void): Promise<void> {
+  const base = normalizeArgusBaseUrl(serverUrl);
+  if (!base) { return; }
+  try {
+    if (removeClaudeHooksForServer(base)) {
+      log(`[Argus] Removed Claude Code hooks for ${base}`);
+    }
+  } catch (e) {
+    log(`[Argus] Claude hook cleanup error: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (argusEnvVarMatches('ANTHROPIC_BASE_URL', base)) {
+    await removeEnvVarPersistent('ANTHROPIC_BASE_URL');
+    log('[Argus] Cleared user ANTHROPIC_BASE_URL');
+  }
+  const openai = `${base}/openai`;
+  if (argusEnvVarMatches('OPENAI_BASE_URL', openai)) {
+    await removeEnvVarPersistent('OPENAI_BASE_URL');
+    log('[Argus] Cleared user OPENAI_BASE_URL');
+  }
+  const google = `${base}/google`;
+  if (argusEnvVarMatches('GOOGLE_GEMINI_BASE_URL', google)) {
+    await removeEnvVarPersistent('GOOGLE_GEMINI_BASE_URL');
+    log('[Argus] Cleared user GOOGLE_GEMINI_BASE_URL');
+  }
+}
+
+function getConfiguredServerUrl(config = vscode.workspace.getConfiguration('argus')): string {
+  return (config.get<string>('serverUrl', DEFAULT_SERVER_URL) ?? '').trim();
+}
 
 export function activate(context: vscode.ExtensionContext) {
   // Set OTEL env vars FIRST — before Copilot Chat reads them.
   // These take precedence over VS Code settings per Copilot's docs.
   process.env.COPILOT_OTEL_ENABLED = 'true';
   process.env.COPILOT_OTEL_CAPTURE_CONTENT = 'true';
+  // Also set the standard OTEL capture content env var that Copilot's code sets internally
+  process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = 'true';
+
+  // Pre-set the OTLP endpoint to the fixed port BEFORE Copilot reads it.
+  // Both env vars AND VS Code settings must be set here — Copilot caches
+  // the endpoint at activation time, so it must see the correct port immediately.
+  // If the preferred port is busy, startOtelCapture() will update the setting
+  // to the actual port later, but the common case (port available) works on first load.
+  const otlpEndpoint = `http://127.0.0.1:${PREFERRED_OTLP_PORT}`;
+  process.env.OTEL_EXPORTER_OTLP_ENDPOINT = otlpEndpoint;
+  process.env.OTEL_EXPORTER_OTLP_PROTOCOL = 'http/json';
+  process.env.OTEL_EXPORTER_OTLP_COMPRESSION = 'none';
+
+  // ALWAYS force-write all OTEL settings — conditional checks read stale values
+  // and cause port mismatches (e.g., setting says 14319 but server is on 14318).
+  const copilotChatConfig = vscode.workspace.getConfiguration('github.copilot.chat');
+  copilotChatConfig.update('otel.otlpEndpoint', otlpEndpoint, vscode.ConfigurationTarget.Global);
+  copilotChatConfig.update('otel.exporterType', 'otlp-http', vscode.ConfigurationTarget.Global);
+  copilotChatConfig.update('otel.enabled', true, vscode.ConfigurationTarget.Global);
+  copilotChatConfig.update('otel.captureContent', true, vscode.ConfigurationTarget.Global);
 
   // Create output channel FIRST and log immediately — this is the primary diagnostic
   outputChannel = vscode.window.createOutputChannel('Argus');
-  outputChannel.appendLine(`[Argus] Extension activating... (v0.20.0)`);
+  outputChannel.appendLine(`[Argus] Extension activating... (v0.22.1)`);
   outputChannel.appendLine(`[Argus] VS Code: ${vscode.version}, Node: ${process.version}, Platform: ${process.platform}`);
   outputChannel.appendLine(`[Argus] fetch available: ${typeof globalThis.fetch}, pid: ${process.pid}`);
 
@@ -61,9 +115,18 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand('argus.connect', connectToServer),
     vscode.commands.registerCommand('argus.disconnect', disconnectFromServer),
+    vscode.commands.registerCommand('argus.resetLocalProxyConfig', resetLocalArgusProxyConfig),
     vscode.commands.registerCommand('argus.openDashboard', openDashboard),
     vscode.commands.registerCommand('argus.showStatus', showStatus),
     vscode.commands.registerCommand('argus.showCopilotLog', () => outputChannel.show()),
+    vscode.commands.registerCommand('argus.openOtelDebugFolder', async () => {
+      const folder = vscode.Uri.file(require('path').join(require('os').homedir(), 'Desktop', 'argus-otel-debug'));
+      try {
+        await vscode.env.openExternal(folder);
+      } catch (err) {
+        vscode.window.showErrorMessage(`Argus: couldn't open debug folder — ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }),
     vscode.commands.registerCommand('argus.testCopilotCapture', async () => {
       const stats = getInterceptStats();
       const lm = getLmStatus();
@@ -101,8 +164,11 @@ export function activate(context: vscode.ExtensionContext) {
         `--- OTEL Capture (Primary Chat Capture) ---`,
         `OTEL active: ${getOtelStats().active}`,
         `OTEL captures: ${getOtelStats().captureCount}`,
-        `OTEL file: ${getOtelStats().otelFilePath}`,
-        `OTEL file offset: ${getOtelStats().fileOffset}`,
+        `OTEL port: ${getOtelStats().serverPort} (${getOtelStats().isFixedPort ? 'fixed' : 'random'})`,
+        `OTEL HTTP requests: ${getOtelStats().totalHttpRequests}`,
+        `OTEL parse errors: ${getOtelStats().parseErrors}`,
+        `OTEL file watcher: ${getOtelStats().fileWatcherActive ? 'active' : 'inactive'}`,
+        `OTEL file records: ${getOtelStats().fileRecordCount}`,
         `--- LM Intercept (Fallback) ---`,
         `LM intercept active: ${lmIntercept.active}`,
         `LM intercept location: ${lmIntercept.patchLocation ?? 'none'}`,
@@ -126,7 +192,7 @@ export function activate(context: vscode.ExtensionContext) {
   // Apply Copilot interception patches IMMEDIATELY during activation.
   const config = vscode.workspace.getConfiguration('argus');
   const enableCopilot = config.get<boolean>('enableCopilot', true);
-  const serverUrl = config.get<string>('serverUrl', 'http://54.196.154.205:4080');
+  const serverUrl = getConfiguredServerUrl(config);
   const rawUser = process.env.USERNAME ?? process.env.USER ?? 'unknown';
   const debug = config.get<boolean>('copilotDebugMode', false);
 
@@ -136,7 +202,7 @@ export function activate(context: vscode.ExtensionContext) {
     outputChannel.appendLine(`[${new Date().toISOString().slice(11, 23)}] ${msg}`);
   };
 
-  if (enableCopilot) {
+  if (enableCopilot && serverUrl) {
     try {
       outputChannel.appendLine('[Argus] Starting Copilot capture setup...');
       setupCopilotCapture(serverUrl, rawUser, logger, debug).then((ok) => {
@@ -154,13 +220,40 @@ export function activate(context: vscode.ExtensionContext) {
       outputChannel.appendLine(`[Argus] Copilot setup sync error: ${copilotErr}`);
     }
   } else {
-    outputChannel.appendLine('[Argus] Copilot capture disabled in settings');
+    outputChannel.appendLine(enableCopilot
+      ? '[Argus] Copilot capture skipped - no Argus server URL configured'
+      : '[Argus] Copilot capture disabled in settings');
+  }
+
+  // OpenAI Codex capture
+  const enableCodex = config.get<boolean>('enableCodex', true);
+  if (enableCodex && serverUrl) {
+    try {
+      outputChannel.appendLine('[Argus] Starting Codex capture setup...');
+      setupCodexCapture(serverUrl, rawUser, logger, debug).then((ok) => {
+        if (ok) {
+          outputChannel.appendLine('[Argus] Codex capture ACTIVE');
+        } else {
+          outputChannel.appendLine('[Argus] Codex not detected — capture skipped');
+        }
+      }).catch((err) => {
+        outputChannel.appendLine(`[Argus] Codex setup error: ${err}`);
+      });
+    } catch (codexErr) {
+      outputChannel.appendLine(`[Argus] Codex setup sync error: ${codexErr}`);
+    }
+  } else {
+    outputChannel.appendLine(enableCodex
+      ? '[Argus] Codex capture skipped - no Argus server URL configured'
+      : '[Argus] Codex capture disabled in settings');
   }
 
   // Auto-connect on startup (deferred to not block activation)
-  if (config.get<boolean>('autoConnect', true)) {
+  if (config.get<boolean>('autoConnect', true) && serverUrl) {
     // Use setTimeout to defer — ensures activation returns quickly
     setTimeout(connectToServer, 0);
+  } else if (config.get<boolean>('autoConnect', true)) {
+    outputChannel.appendLine('[Argus] Auto-connect skipped - no Argus server URL configured');
   }
 }
 
@@ -169,7 +262,7 @@ async function connectToServer() {
   connectionInProgress = true;
 
   const config = vscode.workspace.getConfiguration('argus');
-  const serverUrl = config.get<string>('serverUrl', 'http://54.196.154.205:4080');
+  const serverUrl = getConfiguredServerUrl(config);
 
   if (!serverUrl) {
     vscode.window.showErrorMessage('Argus: No server URL configured. Set argus.serverUrl in settings.');
@@ -212,14 +305,19 @@ async function connectToServer() {
     const enableCopilot = config.get<boolean>('enableCopilot', true);
     const copilotConfigured = enableCopilot; // Already set up in activate()
 
+    // 7. Codex capture was already started in activate()
+    const enableCodex2 = config.get<boolean>('enableCodex', true);
+    const codexConfigured = enableCodex2;
+
     connected = true;
     updateStatusBar('connected');
 
-    // 7. Build success message
+    // 8. Build success message
     const configured: string[] = [];
     if (claudeConfigured) { configured.push('Claude Code'); }
     if (geminiCliConfigured) { configured.push('Gemini CLI'); }
     if (copilotConfigured) { configured.push('GitHub Copilot'); }
+    if (codexConfigured) { configured.push('OpenAI Codex'); }
 
     const parts: string[] = [`Argus connected to ${serverUrl}`];
     if (configured.length > 0) {
@@ -250,20 +348,60 @@ async function connectToServer() {
 async function disconnectFromServer() {
   try { stopLmMonitor(); } catch { /* best effort */ }
   try { await teardownCopilotCapture(); } catch { /* best effort */ }
+  try { await teardownCodexCapture(); } catch { /* best effort */ }
+  const config = vscode.workspace.getConfiguration('argus');
+  const serverUrl = getConfiguredServerUrl(config);
+  if (serverUrl) {
+    await teardownArgusProviderEnv(serverUrl, (msg) => outputChannel.appendLine(msg));
+  }
   connected = false;
   updateStatusBar('disconnected');
   vscode.window.showInformationMessage('Argus disconnected');
 }
 
+async function resetLocalArgusProxyConfig() {
+  const config = vscode.workspace.getConfiguration('argus');
+  let baseUrl = getConfiguredServerUrl(config);
+  if (!baseUrl) {
+    const input = await vscode.window.showInputBox({
+      title: 'Argus: Reset local proxy config',
+      prompt:
+        'Base URL to remove from Claude Code hooks and matching user env vars (e.g. http://host:4080). Cancel to abort.',
+      placeHolder: 'http://localhost:4080',
+    });
+    if (!input?.trim()) { return; }
+    baseUrl = input.trim();
+  }
+  await teardownArgusProviderEnv(baseUrl, (msg) => outputChannel.appendLine(msg));
+  void vscode.window.showInformationMessage(
+    `Argus: Local proxy teardown finished for ${normalizeArgusBaseUrl(baseUrl)}`
+  );
+}
+
 function openDashboard() {
   const config = vscode.workspace.getConfiguration('argus');
-  const serverUrl = config.get<string>('serverUrl', 'http://54.196.154.205:4080');
+  const serverUrl = getConfiguredServerUrl(config);
+  if (!serverUrl) {
+    void vscode.window.showErrorMessage('Argus: No server URL configured. Set argus.serverUrl in settings.');
+    return;
+  }
   vscode.env.openExternal(vscode.Uri.parse(serverUrl));
 }
 
 async function showStatus() {
   const config = vscode.workspace.getConfiguration('argus');
-  const serverUrl = config.get<string>('serverUrl', 'http://54.196.154.205:4080');
+  const serverUrl = getConfiguredServerUrl(config);
+
+  if (!serverUrl) {
+    const action = await vscode.window.showInformationMessage(
+      'Argus server URL is not configured.',
+      'Open Settings'
+    );
+    if (action === 'Open Settings') {
+      vscode.commands.executeCommand('workbench.action.openSettings', 'argus.serverUrl');
+    }
+    return;
+  }
 
   if (!connected) {
     const action = await vscode.window.showInformationMessage(
@@ -342,5 +480,6 @@ function updateStatusBar(state: 'connected' | 'disconnected' | 'connecting' | 'e
 export async function deactivate() {
   try { stopLmMonitor(); } catch { /* best effort */ }
   try { await teardownCopilotCapture(); } catch { /* best effort */ }
+  try { await teardownCodexCapture(); } catch { /* best effort */ }
   statusBarItem?.dispose();
 }

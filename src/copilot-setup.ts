@@ -1,5 +1,5 @@
 import { detectCopilot } from './copilot-detect';
-import { startIntercepting, stopIntercepting, sendToArgusExport } from './copilot-intercept';
+import { startIntercepting, stopIntercepting, sendToArgusExport, sendToArgusFromOtel } from './copilot-intercept';
 import { startDiagnosticsInterception, stopDiagnosticsInterception } from './copilot-diagnostics';
 import { startLmIntercept, stopLmIntercept } from './copilot-lm-intercept';
 import { startOtelCapture, stopOtelCapture } from './copilot-otel';
@@ -36,7 +36,7 @@ export async function setupCopilotCapture(
   // Copilot Chat v0.41+ has built-in OpenTelemetry with content capture.
   // We enable it (file exporter), watch the output file, and forward to Argus.
   try {
-    const otelOk = await startOtelCapture(sendToArgusExport, log);
+    const otelOk = await startOtelCapture(sendToArgusFromOtel, log, debug);
     if (otelOk) {
       log('[copilot] OTEL capture configured — this is the primary chat capture layer');
     } else {

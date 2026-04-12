@@ -13,6 +13,7 @@ import diagnostics_channel from 'node:diagnostics_channel';
 import http2 from 'node:http2';
 import type { ClientHttp2Session, ClientHttp2Stream, IncomingHttpHeaders, IncomingHttpStatusHeader } from 'node:http2';
 import { isCopilotDomain } from './copilot-intercept';
+import { isOtelCaptureActive } from './copilot-otel';
 
 const MAX_REQUEST_BODY = 50 * 1024;
 const MAX_RESPONSE_BODY = 100 * 1024;
@@ -257,7 +258,7 @@ function flushRequest(request: object): void {
     `completion=${completion ? 'yes(' + completion.length + ')' : 'no'} status=${state.statusCode}`,
   );
 
-  if (sendFn) {
+  if (sendFn && !(isOtelCaptureActive() && isCopilotDomain(state.hostname))) {
     sendFn({
       session_id: `copilot-${new Date().toISOString().slice(0, 10)}`,
       domain: state.hostname,
@@ -457,7 +458,7 @@ function wrapHttp2Session(session: ClientHttp2Session, hostname: string, logger:
         );
 
         diagInterceptCount++;
-        if (sendFn) {
+        if (sendFn && !(isOtelCaptureActive() && isCopilotDomain(hostname))) {
           sendFn({
             session_id: `copilot-${new Date().toISOString().slice(0, 10)}`,
             domain: hostname,

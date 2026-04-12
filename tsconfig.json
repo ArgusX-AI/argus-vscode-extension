@@ -11,5 +11,5 @@
     "skipLibCheck": true,
     "resolveJsonModule": true
   },
-  "exclude": ["node_modules", "out", "src/__tests__"]
+  "exclude": ["node_modules", "out"]
 }

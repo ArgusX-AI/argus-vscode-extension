@@ -3,6 +3,7 @@ import * as http from 'http';
 import * as tls from 'tls';
 import * as stream from 'stream';
 import type { ClientRequest, RequestOptions, IncomingMessage } from 'http';
+import { isOtelCaptureActive } from './copilot-otel';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const Module = require('module') as { prototype: { require: (id: string) => unknown } };
@@ -111,8 +112,12 @@ export function extractMethod(args: unknown[]): string {
   return 'GET';
 }
 
-/** Fire-and-forget POST to the Argus server. Never throws. */
-function sendToArgus(payload: Record<string, unknown>): void {
+/** Fire-and-forget POST to the Argus server. Skips non-OTEL events when OTEL is active. */
+function sendToArgus(payload: Record<string, unknown>, fromOtel = false): void {
+  // When OTEL is active, suppress non-OTEL events for Copilot domains only.
+  // Codex/Gemini traffic is never suppressed.
+  const domain = String(payload.domain ?? '');
+  if (!fromOtel && isOtelCaptureActive() && isCopilotDomain(domain)) return;
   try {
     const body = JSON.stringify(payload);
     const url = new URL(`${serverUrl}/hooks/CopilotRequest`);
@@ -1124,4 +1129,9 @@ export function stopIntercepting(): void {
 /** Public wrapper for sendToArgus — used by copilot-diagnostics.ts */
 export function sendToArgusExport(payload: Record<string, unknown>): void {
   sendToArgus(payload);
+}
+
+/** Unguarded sender for OTEL layer — bypasses the isOtelCaptureActive() suppression. */
+export function sendToArgusFromOtel(payload: Record<string, unknown>): void {
+  sendToArgus(payload, true);
 }
