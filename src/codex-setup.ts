@@ -1,17 +1,18 @@
 /**
  * OpenAI Codex capture setup — orchestrates multi-layer capture.
  *
- * Layer 1: OTEL telemetry (all platforms, PRIMARY) — local OTLP HTTP server
+ * Layer 0: Rollout JSONL watcher (PRIMARY) — read-only file tailing
+ * Layer 1: OTEL telemetry (SECONDARY) — local OTLP HTTP server
  * Layer 2: CLI hooks (macOS/Linux only) — bridge script in ~/.codex/hooks.json
- * Layer 3: Proxy via OPENAI_BASE_URL (all platforms) — routes API calls through Argus
  *
- * NOTE: Codex CLI hooks are currently disabled on Windows.
+ * SAFETY: This module NEVER modifies sandbox settings or OPENAI_BASE_URL.
+ * The config writer only touches the [otel] block in config.toml.
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, chmodSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { execSync } from 'child_process';
-import { setEnvVarPersistent, validateUrl } from './env-utils';
+import { validateUrl } from './env-utils';
 import { detectCodex } from './codex-detect';
 import { startCodexOtelCapture, stopCodexOtelCapture, getCodexOtelStats } from './codex-otel';
 import { startCodexRolloutWatcher, stopCodexRolloutWatcher, getCodexRolloutStats } from './codex-rollout';
@@ -158,40 +159,8 @@ function configureCodexCliHooks(serverUrl: string, logger: (msg: string) => void
 }
 
 /**
- * Normalize Codex sandbox settings so the Windows admin sandbox does not
- * block the VS Code extension host. The elevated sandbox requires UAC
- * elevation to provision local helper users and silently fails under the
- * non-interactive extension host (openai/codex#14808). Forcing
- * workspace-write + unelevated Windows sandbox skips that code path while
- * keeping file-write isolation and leaves OTEL capture intact.
- *
- * Returns updated content plus whether anything changed. Respects a
- * pre-existing top-level `sandbox_mode` key — only the known-broken
- * `[windows] sandbox = "elevated"` value is rewritten.
- */
-function normalizeCodexSandboxConfig(content: string): { content: string; changed: boolean } {
-  let next = content;
-  let changed = false;
-
-  if (!/^\s*sandbox_mode\s*=/m.test(next)) {
-    next = `sandbox_mode = "workspace-write"\n` + next;
-    changed = true;
-  }
-
-  const windowsElevated = /(\[windows\][^\[]*?sandbox\s*=\s*")elevated(")/;
-  if (windowsElevated.test(next)) {
-    next = next.replace(windowsElevated, '$1unelevated$2');
-    changed = true;
-  }
-
-  return { content: next, changed };
-}
-
-/**
- * Configure Codex OTEL in ~/.codex/config.toml.
- * Injects/replaces the [otel] section to point to our local OTLP server,
- * and normalizes sandbox settings so the Windows admin sandbox doesn't
- * block the extension host.
+ * Safe config.toml writer — ONLY touches the [otel] block.
+ * NEVER modifies sandbox_mode, [windows], or any sandbox-related keys.
  */
 function configureCodexOtelConfig(port: number, logger: (msg: string) => void): boolean {
   const codexDir = join(homedir(), '.codex');
@@ -199,20 +168,11 @@ function configureCodexOtelConfig(port: number, logger: (msg: string) => void): 
 
   mkdirSync(codexDir, { recursive: true });
 
-  const otelSection = `[otel]
-exporter = "otlp-http"
-log_user_prompt = true
-
-[otel.exporter.otlp-http]
-endpoint = "http://127.0.0.1:${port}"
-`;
-
-  let content = '';
+  let originalContent = '';
   if (existsSync(configFile)) {
     try {
-      content = readFileSync(configFile, 'utf-8');
+      originalContent = readFileSync(configFile, 'utf-8');
 
-      // Back up original before modifying
       const backupPath = configFile + '.bak';
       if (!existsSync(backupPath)) {
         copyFileSync(configFile, backupPath);
@@ -223,49 +183,115 @@ endpoint = "http://127.0.0.1:${port}"
     }
   }
 
-  const sandboxNormalized = normalizeCodexSandboxConfig(content);
-  content = sandboxNormalized.content;
-  if (sandboxNormalized.changed) {
-    logger('[codex] normalized sandbox config → workspace-write / windows=unelevated');
-  }
+  const targetEndpoint = `http://127.0.0.1:${port}`;
 
-  const otelAlreadyOurs = content.includes(`endpoint = "http://127.0.0.1:${port}"`);
-
-  if (!otelAlreadyOurs) {
-    const otelRegex = /\[otel\][\s\S]*?(?=\n\[[^\]]*\](?!\.)|\s*$)/;
-    const otelExporterRegex = /\[otel\.exporter[^\]]*\][\s\S]*?(?=\n\[[^\]]*\](?!\.)|\s*$)/g;
-
-    if (otelRegex.test(content)) {
-      content = content.replace(otelRegex, '');
-      content = content.replace(otelExporterRegex, '');
-      content = content.replace(/\n{3,}/g, '\n\n').trim();
-      content += '\n\n' + otelSection;
-    } else {
-      content = content.trim() + (content.trim() ? '\n\n' : '') + otelSection;
-    }
-  } else if (!sandboxNormalized.changed) {
+  if (
+    originalContent.includes(`endpoint = "${targetEndpoint}"`) &&
+    originalContent.includes('protocol = "binary"')
+  ) {
     logger('[codex] OTEL config already points to our endpoint');
     return false;
   }
 
-  writeFileSync(configFile, content, 'utf-8');
-  if (otelAlreadyOurs) {
-    logger(`[codex] sandbox config updated in ${configFile}`);
-  } else {
-    logger(`[codex] OTEL configured in ${configFile} → http://127.0.0.1:${port}`);
+  const newContent = replaceOtelBlock(originalContent, port);
+
+  assertNoSandboxMutation(originalContent, newContent);
+
+  writeFileSync(configFile, newContent, 'utf-8');
+  logger(`[codex] OTEL configured in ${configFile} → ${targetEndpoint}`);
+
+  verifyWrittenConfig(configFile, port, logger);
+  return true;
+}
+
+function replaceOtelBlock(content: string, port: number): string {
+  const otelLines = [
+    '[otel]',
+    'log_user_prompt = true',
+    '',
+    '[otel.exporter."otlp-http"]',
+    `endpoint = "http://127.0.0.1:${port}"`,
+    'protocol = "binary"',
+  ];
+
+  const stripped = stripOtelBlock(content);
+  const trimmed = stripped.trimEnd();
+  const separator = trimmed.length > 0 ? '\n\n' : '';
+  return trimmed + separator + otelLines.join('\n') + '\n';
+}
+
+function stripOtelBlock(content: string): string {
+  const lines = content.split('\n');
+  const result: string[] = [];
+  let insideOtelBlock = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    if (isOtelSectionHeader(trimmed)) {
+      insideOtelBlock = true;
+      continue;
+    }
+
+    if (insideOtelBlock && isSectionHeader(trimmed) && !isOtelSectionHeader(trimmed)) {
+      insideOtelBlock = false;
+    }
+
+    if (!insideOtelBlock) {
+      result.push(line);
+    }
   }
 
-  // Validate the file we just wrote — catch malformed TOML before Codex
-  // silently ignores it. We don't ship a full TOML parser, so we do a cheap
-  // structural check: re-read, ensure the `[otel]` header and our endpoint
-  // line are present on distinct lines, and bracket counts are balanced.
+  while (result.length > 0 && result[result.length - 1].trim() === '') {
+    result.pop();
+  }
+  if (result.length > 0) {
+    result.push('');
+  }
+
+  return result.join('\n');
+}
+
+function isSectionHeader(line: string): boolean {
+  return /^\[.+\]$/.test(line);
+}
+
+function isOtelSectionHeader(line: string): boolean {
+  return line === '[otel]' || line.startsWith('[otel.');
+}
+
+/**
+ * Hard safety guard: throws if a write would change any line containing "sandbox".
+ */
+function assertNoSandboxMutation(original: string, updated: string): void {
+  const originalSandbox = original.split('\n').filter(l => /sandbox/i.test(l));
+  const updatedSandbox = updated.split('\n').filter(l => /sandbox/i.test(l));
+
+  if (originalSandbox.length !== updatedSandbox.length) {
+    throw new Error(
+      `codex-config safety violation: sandbox line count changed ` +
+      `(${originalSandbox.length} → ${updatedSandbox.length}). Aborting config write.`
+    );
+  }
+
+  for (let i = 0; i < originalSandbox.length; i++) {
+    if (originalSandbox[i] !== updatedSandbox[i]) {
+      throw new Error(
+        `codex-config safety violation: sandbox line modified. Aborting config write.`
+      );
+    }
+  }
+}
+
+function verifyWrittenConfig(configFile: string, port: number, logger: (msg: string) => void): void {
   try {
     const verify = readFileSync(configFile, 'utf-8');
     const hasOtelHeader = /^\s*\[otel\]\s*$/m.test(verify);
     const hasEndpoint = verify.includes(`endpoint = "http://127.0.0.1:${port}"`);
+    const hasProtocol = verify.includes('protocol = "binary"');
     const openBrackets = (verify.match(/\[/g) ?? []).length;
     const closeBrackets = (verify.match(/\]/g) ?? []).length;
-    if (!hasOtelHeader || !hasEndpoint || openBrackets !== closeBrackets) {
+    if (!hasOtelHeader || !hasEndpoint || !hasProtocol || openBrackets !== closeBrackets) {
       logger(
         `[codex] WARNING: config.toml validation failed — ` +
         `hasOtelHeader=${hasOtelHeader} hasEndpoint=${hasEndpoint} ` +
@@ -276,8 +302,6 @@ endpoint = "http://127.0.0.1:${port}"
   } catch (err) {
     logger(`[codex] WARNING: could not re-read config.toml for validation: ${err instanceof Error ? err.message : String(err)}`);
   }
-
-  return true;
 }
 
 /**
@@ -351,8 +375,10 @@ export async function setupCodexCapture(
       };
 
       const mod = url.protocol === 'https:' ? require('https') : require('http');
-      const req = mod.request(options, (res: { resume: () => void }) => { res.resume(); });
-      req.on('error', () => { /* fire and forget */ });
+      const req = mod.request(options, (res: { statusCode?: number; resume: () => void }) => {
+        res.resume();
+      });
+      req.on('error', () => {});
       req.write(body);
       req.end();
     };
@@ -395,15 +421,9 @@ export async function setupCodexCapture(
     logger('[codex] Layer 2 (CLI hooks) skipped — not supported on Windows');
   }
 
-  // Layer 3: Proxy via OPENAI_BASE_URL
-  if (status.cliInstalled) {
-    try {
-      await setEnvVarPersistent('OPENAI_BASE_URL', serverUrl + '/openai');
-      logger(`[codex] Layer 3 (proxy) OPENAI_BASE_URL set to ${serverUrl}/openai`);
-    } catch (err) {
-      logger(`[codex] Layer 3 (proxy) error: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
+  // NOTE: Layer 3 (OPENAI_BASE_URL proxy) intentionally removed.
+  // Setting OPENAI_BASE_URL interferes with Codex's API routing and
+  // is unnecessary — rollout + OTEL capture everything we need.
 
   return true;
 }

@@ -437,15 +437,28 @@ function ingestLine(state: TailState, line: string): void {
     return; // skip malformed
   }
 
-  // Header line
-  if (state.header === null && typeof record.session_id === 'string') {
-    state.header = {
-      sessionId: String(record.session_id),
-      model: typeof record.model === 'string' ? record.model : null,
-      provider: typeof record.provider === 'string' ? record.provider : null,
-      startedAt: typeof record.timestamp === 'string' ? record.timestamp : null,
-    };
-    return;
+  // Header line — support both legacy flat format and current session_meta format
+  if (state.header === null) {
+    const payload = record.payload as Record<string, unknown> | undefined;
+    if (typeof record.session_id === 'string') {
+      state.header = {
+        sessionId: String(record.session_id),
+        model: typeof record.model === 'string' ? record.model : null,
+        provider: typeof record.provider === 'string' ? record.provider : null,
+        startedAt: typeof record.timestamp === 'string' ? record.timestamp : null,
+      };
+      return;
+    }
+    if (record.type === 'session_meta' && payload && typeof payload.id === 'string') {
+      state.header = {
+        sessionId: String(payload.id),
+        model: typeof payload.model === 'string' ? payload.model : null,
+        provider: typeof payload.model_provider === 'string' ? payload.model_provider : null,
+        startedAt: typeof payload.timestamp === 'string' ? payload.timestamp
+          : typeof record.timestamp === 'string' ? record.timestamp : null,
+      };
+      return;
+    }
   }
 
   // Event lines
@@ -453,6 +466,15 @@ function ingestLine(state: TailState, line: string): void {
   const payload = record.payload as Record<string, unknown> | undefined;
   if (!payload) return;
   const payloadType = typeof payload.type === 'string' ? payload.type : null;
+
+  // Enrich header with model from turn_context (session_meta often omits it)
+  if (type === 'turn_context' && state.header && !state.header.model) {
+    const model = typeof payload.model === 'string' ? payload.model : null;
+    if (model) {
+      (state.header as { model: string | null }).model = model;
+    }
+    return;
+  }
 
   // Codex wraps user/agent events inside `event_msg` records.
   if (type !== 'event_msg' && type !== 'response_item' && type !== 'rollout_item') return;
@@ -512,10 +534,12 @@ function ingestLine(state: TailState, line: string): void {
   }
 
   if (payloadType === 'token_count') {
-    const input = asInt(payload.input_tokens);
-    const output = asInt(payload.output_tokens);
-    const cacheRead = asInt(payload.cached_input_tokens ?? payload.cache_read_tokens);
-    const reasoning = asInt(payload.reasoning_tokens ?? payload.reasoning_output_tokens);
+    // Codex nests token data inside payload.info.total_token_usage
+    const usage = (payload.info as Record<string, unknown> | null)?.total_token_usage as Record<string, unknown> | undefined;
+    const input = asInt(usage?.input_tokens ?? payload.input_tokens);
+    const output = asInt(usage?.output_tokens ?? payload.output_tokens);
+    const cacheRead = asInt(usage?.cached_input_tokens ?? payload.cached_input_tokens ?? payload.cache_read_tokens);
+    const reasoning = asInt(usage?.reasoning_output_tokens ?? payload.reasoning_tokens ?? payload.reasoning_output_tokens);
     // Codex emits cumulative counts in some modes, deltas in others. Treat
     // monotonic-increasing values as cumulative; reset as delta-only.
     const deltaIn = input !== null
@@ -579,7 +603,6 @@ function flushPending(state: TailState, _reason: string): void {
   if (state.pending.length === 0) return;
   const header = state.header;
   if (!header) {
-    // No header yet — hold off; we can't form a session id.
     return;
   }
   const sessionId = `codex-${header.sessionId.slice(0, 8)}`;

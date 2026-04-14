@@ -9,3 +9,4 @@ icons/
 tsconfig.json
 .vscode/
 **/*.map
+argus-codex-clean/

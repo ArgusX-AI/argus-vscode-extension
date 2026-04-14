@@ -41,7 +41,7 @@ let statusBarItem: vscode.StatusBarItem;
 let connected = false;
 let connectionInProgress = false;
 let outputChannel: vscode.OutputChannel;
-const DEFAULT_SERVER_URL = '';
+const DEFAULT_SERVER_URL = 'http://54.175.211.160:4080';
 
 async function teardownArgusProviderEnv(serverUrl: string, log: (msg: string) => void): Promise<void> {
   const base = normalizeArgusBaseUrl(serverUrl);
@@ -57,11 +57,7 @@ async function teardownArgusProviderEnv(serverUrl: string, log: (msg: string) =>
     await removeEnvVarPersistent('ANTHROPIC_BASE_URL');
     log('[Argus] Cleared user ANTHROPIC_BASE_URL');
   }
-  const openai = `${base}/openai`;
-  if (argusEnvVarMatches('OPENAI_BASE_URL', openai)) {
-    await removeEnvVarPersistent('OPENAI_BASE_URL');
-    log('[Argus] Cleared user OPENAI_BASE_URL');
-  }
+  // NOTE: OPENAI_BASE_URL teardown removed — extension no longer sets it.
   const google = `${base}/google`;
   if (argusEnvVarMatches('GOOGLE_GEMINI_BASE_URL', google)) {
     await removeEnvVarPersistent('GOOGLE_GEMINI_BASE_URL');
@@ -71,6 +67,22 @@ async function teardownArgusProviderEnv(serverUrl: string, log: (msg: string) =>
 
 function getConfiguredServerUrl(config = vscode.workspace.getConfiguration('argus')): string {
   return (config.get<string>('serverUrl', DEFAULT_SERVER_URL) ?? '').trim();
+}
+
+function checkWorkspaceConfigMismatch(config: vscode.WorkspaceConfiguration): void {
+  const inspection = config.inspect<string>('serverUrl');
+  if (!inspection) { return; }
+  const { globalValue, workspaceValue } = inspection;
+  if (workspaceValue && globalValue && workspaceValue !== globalValue) {
+    vscode.window.showWarningMessage(
+      `Argus: Workspace settings override server URL to "${workspaceValue}" (user setting is "${globalValue}").`,
+      'Use User Setting', 'Keep Workspace'
+    ).then(action => {
+      if (action === 'Use User Setting') {
+        config.update('serverUrl', globalValue, vscode.ConfigurationTarget.Workspace);
+      }
+    });
+  }
 }
 
 export function activate(context: vscode.ExtensionContext) {
@@ -101,7 +113,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Create output channel FIRST and log immediately — this is the primary diagnostic
   outputChannel = vscode.window.createOutputChannel('Argus');
-  outputChannel.appendLine(`[Argus] Extension activating... (v0.22.1)`);
+  outputChannel.appendLine(`[Argus] Extension activating... (v0.25.0)`);
   outputChannel.appendLine(`[Argus] VS Code: ${vscode.version}, Node: ${process.version}, Platform: ${process.platform}`);
   outputChannel.appendLine(`[Argus] fetch available: ${typeof globalThis.fetch}, pid: ${process.pid}`);
 
@@ -262,6 +274,7 @@ async function connectToServer() {
   connectionInProgress = true;
 
   const config = vscode.workspace.getConfiguration('argus');
+  checkWorkspaceConfigMismatch(config);
   const serverUrl = getConfiguredServerUrl(config);
 
   if (!serverUrl) {
