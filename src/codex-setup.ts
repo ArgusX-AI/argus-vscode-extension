@@ -16,6 +16,7 @@ import { validateUrl } from './env-utils';
 import { detectCodex } from './codex-detect';
 import { startCodexOtelCapture, stopCodexOtelCapture, getCodexOtelStats } from './codex-otel';
 import { startCodexRolloutWatcher, stopCodexRolloutWatcher, getCodexRolloutStats } from './codex-rollout';
+import { isDebugDumpEnabled, dumpProcessedEvent } from './codex-debug-dump';
 
 const CODEX_HOOK_EVENTS = [
   'SessionStart',
@@ -357,6 +358,9 @@ export async function setupCodexCapture(
   // so the server can dedupe between rollout and OTEL events.
   const makeSender = (source: 'rollout' | 'otel') =>
     (payload: Record<string, unknown>) => {
+      if (isDebugDumpEnabled()) {
+        dumpProcessedEvent({ _source: source, ...payload });
+      }
       const body = JSON.stringify(payload);
       const url = new URL(`${serverUrl}/hooks/CodexRequest`);
       const options = {
@@ -384,7 +388,7 @@ export async function setupCodexCapture(
     };
 
   // Layer 0: Rollout JSONL watcher (PRIMARY — always works, no config dep)
-  const rolloutOk = startCodexRolloutWatcher(makeSender('rollout'), logger);
+  const rolloutOk = startCodexRolloutWatcher(makeSender('rollout'), logger, user);
   logger(`[codex] Layer 0 (rollout-watcher): ${rolloutOk ? 'on' : 'off'}`);
 
   // Layer 1: OTEL telemetry (secondary — structural gaps documented in plan)

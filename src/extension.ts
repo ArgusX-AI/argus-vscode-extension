@@ -14,6 +14,7 @@ import { getLmInterceptStats } from './copilot-lm-intercept';
 import { getOtelStats, PREFERRED_OTLP_PORT } from './copilot-otel';
 import { setupCodexCapture, teardownCodexCapture } from './codex-setup';
 import { getCodexOtelStats, CODEX_OTLP_PORT } from './codex-otel';
+import { enableDebugDump, disableDebugDump, getDebugDumpDir } from './codex-debug-dump';
 
 function httpRequest(urlStr: string, options: { timeout?: number } = {}): Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }> {
   return new Promise((resolve, reject) => {
@@ -139,6 +140,15 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showErrorMessage(`Argus: couldn't open debug folder — ${err instanceof Error ? err.message : String(err)}`);
       }
     }),
+    vscode.commands.registerCommand('argus.openCodexDebugFolder', async () => {
+      const dumpDir = getDebugDumpDir();
+      const folder = vscode.Uri.file(dumpDir ?? require('path').join(require('os').homedir(), 'Desktop', 'argus-codex-debug'));
+      try {
+        await vscode.env.openExternal(folder);
+      } catch (err) {
+        vscode.window.showErrorMessage(`Argus: couldn't open Codex debug folder — ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }),
     vscode.commands.registerCommand('argus.testCopilotCapture', async () => {
       const stats = getInterceptStats();
       const lm = getLmStatus();
@@ -239,10 +249,15 @@ export function activate(context: vscode.ExtensionContext) {
 
   // OpenAI Codex capture
   const enableCodex = config.get<boolean>('enableCodex', true);
+  const codexDebug = config.get<boolean>('codexDebugMode', false);
+  if (codexDebug) {
+    const dumpDir = enableDebugDump();
+    outputChannel.appendLine(`[Argus] Codex debug dump enabled → ${dumpDir}`);
+  }
   if (enableCodex && serverUrl) {
     try {
       outputChannel.appendLine('[Argus] Starting Codex capture setup...');
-      setupCodexCapture(serverUrl, rawUser, logger, debug).then((ok) => {
+      setupCodexCapture(serverUrl, rawUser, logger, codexDebug).then((ok) => {
         if (ok) {
           outputChannel.appendLine('[Argus] Codex capture ACTIVE');
         } else {
@@ -494,5 +509,6 @@ export async function deactivate() {
   try { stopLmMonitor(); } catch { /* best effort */ }
   try { await teardownCopilotCapture(); } catch { /* best effort */ }
   try { await teardownCodexCapture(); } catch { /* best effort */ }
+  try { disableDebugDump(); } catch { /* best effort */ }
   statusBarItem?.dispose();
 }

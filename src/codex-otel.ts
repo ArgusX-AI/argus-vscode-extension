@@ -16,6 +16,8 @@
  */
 import * as http from 'http';
 import * as zlib from 'zlib';
+import { isDebugDumpEnabled, dumpOtelRaw } from './codex-debug-dump';
+import { makeSessionTitle } from './session-title';
 
 /** Fixed port for the Codex OTLP HTTP receiver (Copilot uses 14318-14322). */
 export const CODEX_OTLP_PORT = 14323;
@@ -31,6 +33,17 @@ let lastSpanTime = 0;
 let sessionCounter = 0;
 let totalHttpRequests = 0;
 let parseErrors = 0;
+
+/**
+ * Cache of `session_id` -> human-readable title derived from the first user
+ * prompt seen on that session. Sent on every subsequent outgoing payload so
+ * the Argus server can display a meaningful session label instead of the
+ * generic "Codex — <model>" fallback.
+ *
+ * Bounded to avoid unbounded growth on long-lived VS Code instances.
+ */
+const sessionTitles = new Map<string, string>();
+const MAX_SESSION_TITLES = 500;
 
 /**
  * Start the local OTLP HTTP receiver for Codex telemetry.
@@ -125,6 +138,9 @@ function createOtlpHandler(logger: (msg: string) => void): http.RequestListener 
 
       try {
         const body = decompressed.toString('utf-8');
+        if (isDebugDumpEnabled()) {
+          dumpOtelRaw(url, body);
+        }
         const data = JSON.parse(body) as Record<string, unknown>;
 
         if (url.includes('/v1/logs')) {
@@ -306,9 +322,22 @@ function processLogRecord(record: Record<string, unknown>, logger: (msg: string)
     const requestType = hasContent ? 'chat' : isToolEvent ? 'tool' : 'inference';
     logger(`[codex:otel:capture] #${captureCount} ${requestType} model=${model} prompt=${prompt?.length ?? 0}ch completion=${completion?.length ?? 0}ch`);
 
+    if (prompt && !sessionTitles.has(sessionId)) {
+      const title = makeSessionTitle(prompt);
+      if (title) {
+        if (sessionTitles.size >= MAX_SESSION_TITLES) {
+          const firstKey = sessionTitles.keys().next().value;
+          if (firstKey) sessionTitles.delete(firstKey);
+        }
+        sessionTitles.set(sessionId, title);
+      }
+    }
+    const sessionTitle = sessionTitles.get(sessionId) ?? null;
+
     if (sendFn) {
       sendFn({
         session_id: sessionId,
+        session_title: sessionTitle,
         model_id: model,
         request_type: requestType,
         prompt: prompt ? prompt.slice(0, 100_000) : null,
@@ -498,6 +527,7 @@ export function stopCodexOtelCapture(): void {
   sessionCounter = 0;
   lastSpanTime = 0;
   captureCount = 0;
+  sessionTitles.clear();
   totalHttpRequests = 0;
   parseErrors = 0;
 }

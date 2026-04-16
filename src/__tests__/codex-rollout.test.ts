@@ -161,6 +161,29 @@ describe('codex-rollout parser', () => {
     expect(eventsSent[0].prompt).toContain('sliding window');
   });
 
+  it('session_title is derived from the first user_message and sent on every event', () => {
+    const send = vi.fn();
+    const { eventsSent } = processRolloutLinesForTest(fixtureLines, send);
+    for (const p of eventsSent) {
+      expect(p.session_title).toBe('Fix the rate limiter to use sliding window');
+    }
+  });
+
+  it('session_title stays pinned to the first user prompt', () => {
+    const send = vi.fn();
+    const secondUser = JSON.stringify({
+      type: 'event_msg',
+      payload: { type: 'user_message', content: 'now switch it to token bucket' },
+    });
+    const { eventsSent } = processRolloutLinesForTest(
+      [fixtureLines[0], fixtureLines[1], secondUser],
+      send,
+    );
+    for (const p of eventsSent) {
+      expect(p.session_title).toBe('Fix the rate limiter to use sliding window');
+    }
+  });
+
   it('events before the header are dropped (no session_id)', () => {
     const send = vi.fn();
     // Put an event before the header — the parser has no header yet so

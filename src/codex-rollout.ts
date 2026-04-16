@@ -33,13 +33,19 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { homedir } from 'os';
+import { isDebugDumpEnabled, dumpRawLine, dumpSummary } from './codex-debug-dump';
+import { makeSessionTitle } from './session-title';
 
 /** Header field stored per rollout file — captured from the first line. */
 interface RolloutHeader {
   readonly sessionId: string;
-  readonly model: string | null;
+  model: string | null;
   readonly provider: string | null;
   readonly startedAt: string | null;
+  readonly systemPrompt: string | null;
+  readonly cwd: string | null;
+  readonly cliVersion: string | null;
+  readonly originator: string | null;
 }
 
 /** Per-file tailing state. */
@@ -58,12 +64,48 @@ interface TailState {
   flushTimer: NodeJS.Timeout | null;
   /** Pending events that haven't been flushed yet. */
   pending: RolloutEvent[];
+  /** Rich turn context from the most recent turn_context record. */
+  turnContext: TurnContext | null;
+  /** Rate limits from the most recent token_count event. */
+  rateLimits: Record<string, unknown> | null;
+  /** Task lifecycle tracking. */
+  taskStartedAt: number | null;
+  modelContextWindow: number | null;
+  collaborationModeKind: string | null;
+  /** Whether system prompt was already sent (send once per session). */
+  systemPromptSent: boolean;
+  /** Developer messages captured from response_item role=developer. */
+  developerMessages: string | null;
+  /** Environment context captured from response_item role=user with <environment_context>. */
+  environmentContext: string | null;
+  /**
+   * Human-readable session title derived from the first user prompt seen on
+   * this rollout. Sent on every subsequent payload so the Argus server can
+   * use it as the session display label (falling back to "Codex — <model>"
+   * when absent).
+   */
+  sessionTitle: string | null;
+}
+
+interface TurnContext {
+  readonly turnId: string | null;
+  readonly traceId: string | null;
+  readonly cwd: string | null;
+  readonly model: string | null;
+  readonly personality: string | null;
+  readonly effort: string | null;
+  readonly collaborationMode: string | null;
+  readonly approvalPolicy: string | null;
+  readonly sandboxPolicy: string | null;
+  readonly timezone: string | null;
+  readonly realtimeActive: boolean | null;
+  readonly truncationPolicy: string | null;
 }
 
 /** One extracted event ready to post to Argus. */
 interface RolloutEvent {
   readonly eventSequence: number;
-  readonly requestType: 'chat' | 'tool' | 'inference';
+  readonly requestType: 'chat' | 'tool' | 'inference' | 'lifecycle' | 'context';
   readonly prompt: string | null;
   readonly completion: string | null;
   readonly toolName: string | null;
@@ -75,6 +117,14 @@ interface RolloutEvent {
   readonly cumulativeOutputTokens: number | null;
   readonly cumulativeCacheReadTokens: number | null;
   readonly cumulativeReasoningTokens: number | null;
+  readonly phase: string | null;
+  readonly rateLimits: string | null;
+  readonly taskDurationMs: number | null;
+  readonly modelContextWindow: number | null;
+  readonly turnContext: string | null;
+  readonly systemPrompt: string | null;
+  readonly developerMessages: string | null;
+  readonly environmentContext: string | null;
 }
 
 /** Matches Codex's actual rollout file naming. */
@@ -92,12 +142,14 @@ let baseDir: string | null = null;
 let dayWatcher: fs.FSWatcher | null = null;
 let dayWatcherPath: string | null = null;
 let midnightTimer: NodeJS.Timeout | null = null;
+let dayRecheckInterval: NodeJS.Timeout | null = null;
 let debounceTimer: NodeJS.Timeout | null = null;
 const tails = new Map<string, TailState>();
 let sendFn: SendFn | null = null;
 let logFn: Logger = () => {};
 let totalEventsEmitted = 0;
 let totalFilesWatched = 0;
+let userName: string | null = null;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -109,9 +161,10 @@ let totalFilesWatched = 0;
  * Returns `true` if the base directory exists and a day-watcher was
  * installed, `false` otherwise (caller should still start OTEL).
  */
-export function startCodexRolloutWatcher(send: SendFn, logger: Logger): boolean {
+export function startCodexRolloutWatcher(send: SendFn, logger: Logger, user?: string): boolean {
   sendFn = send;
   logFn = logger;
+  userName = user ?? process.env.USERNAME ?? process.env.USER ?? null;
 
   const resolved = resolveCodexBaseDir();
   if (!resolved) {
@@ -125,6 +178,7 @@ export function startCodexRolloutWatcher(send: SendFn, logger: Logger): boolean 
 
   installDayWatcher();
   scheduleMidnightRollover();
+  scheduleDayRecheck();
   // Initial scan of today's directory in case files already exist.
   scanTodayDir();
   return true;
@@ -140,6 +194,10 @@ export function stopCodexRolloutWatcher(): void {
   if (midnightTimer) {
     clearTimeout(midnightTimer);
     midnightTimer = null;
+  }
+  if (dayRecheckInterval) {
+    clearInterval(dayRecheckInterval);
+    dayRecheckInterval = null;
   }
   if (debounceTimer) {
     clearTimeout(debounceTimer);
@@ -238,9 +296,14 @@ function resolveCodexBaseDir(): string | null {
 function todaySessionsDir(): string {
   if (!baseDir) throw new Error('baseDir not set');
   const now = new Date();
-  const yyyy = String(now.getUTCFullYear());
-  const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(now.getUTCDate()).padStart(2, '0');
+  // Codex CLI writes rollout files to sessions/YYYY/MM/DD using LOCAL date
+  // (filenames like rollout-2026-04-17T01-10-51-*.jsonl embed local-time
+  // components), so watch the local-date folder — not UTC. Users in
+  // timezones ahead of UTC would otherwise miss all sessions created
+  // between local midnight and UTC midnight.
+  const yyyy = String(now.getFullYear());
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
   return path.join(baseDir, 'sessions', yyyy, mm, dd);
 }
 
@@ -346,12 +409,13 @@ function scanTodayDir(): void {
 function scheduleMidnightRollover(): void {
   if (!active) return;
   const now = new Date();
-  const next = new Date(Date.UTC(
-    now.getUTCFullYear(),
-    now.getUTCMonth(),
-    now.getUTCDate() + 1,
-    0, 0, 5, // 5-second safety margin past midnight UTC
-  ));
+  // Schedule for LOCAL midnight (matches Codex's local-date folder scheme).
+  const next = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate() + 1,
+    0, 0, 5, // 5-second safety margin past local midnight
+  );
   const delay = Math.max(1000, next.getTime() - now.getTime());
   midnightTimer = setTimeout(() => {
     midnightTimer = null;
@@ -359,6 +423,26 @@ function scheduleMidnightRollover(): void {
     scanTodayDir();
     scheduleMidnightRollover();
   }, delay);
+}
+
+/**
+ * Periodically verify the day-watcher is on today's directory. Guards against
+ * the case where the midnight setTimeout is throttled or delayed (VS Code
+ * backgrounded windows, machine sleep/suspend) and the watcher would otherwise
+ * remain stuck on yesterday's day folder after UTC rollover.
+ */
+function scheduleDayRecheck(): void {
+  if (!active) return;
+  if (dayRecheckInterval) clearInterval(dayRecheckInterval);
+  dayRecheckInterval = setInterval(() => {
+    if (!active) return;
+    const dayDir = todaySessionsDir();
+    if (dayWatcherPath !== dayDir) {
+      logFn(`[codex:rollout] Day recheck: watcher on ${dayWatcherPath ?? '<none>'} but today is ${dayDir} — reinstalling`);
+      installDayWatcher();
+    }
+    scanTodayDir();
+  }, 60_000); // every 60s
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +461,15 @@ function makeTailState(filePath: string): TailState {
     cumulativeReasoningTokens: 0,
     flushTimer: null,
     pending: [],
+    turnContext: null,
+    rateLimits: null,
+    taskStartedAt: null,
+    modelContextWindow: null,
+    collaborationModeKind: null,
+    systemPromptSent: false,
+    developerMessages: null,
+    environmentContext: null,
+    sessionTitle: null,
   };
 }
 
@@ -430,6 +523,11 @@ function tailFile(state: TailState): void {
 }
 
 function ingestLine(state: TailState, line: string): void {
+  if (isDebugDumpEnabled()) {
+    const fileName = path.basename(state.filePath, '.jsonl');
+    dumpRawLine(fileName, state.sequence + 1, line);
+  }
+
   let record: Record<string, unknown>;
   try {
     record = JSON.parse(line) as Record<string, unknown>;
@@ -446,17 +544,32 @@ function ingestLine(state: TailState, line: string): void {
         model: typeof record.model === 'string' ? record.model : null,
         provider: typeof record.provider === 'string' ? record.provider : null,
         startedAt: typeof record.timestamp === 'string' ? record.timestamp : null,
+        systemPrompt: null,
+        cwd: null,
+        cliVersion: null,
+        originator: null,
       };
+      if (isDebugDumpEnabled()) {
+        dumpSummary({ type: 'legacy_header', ...record });
+      }
       return;
     }
     if (record.type === 'session_meta' && payload && typeof payload.id === 'string') {
+      const baseInstructions = payload.base_instructions as Record<string, unknown> | undefined;
       state.header = {
         sessionId: String(payload.id),
         model: typeof payload.model === 'string' ? payload.model : null,
         provider: typeof payload.model_provider === 'string' ? payload.model_provider : null,
         startedAt: typeof payload.timestamp === 'string' ? payload.timestamp
           : typeof record.timestamp === 'string' ? record.timestamp : null,
+        systemPrompt: typeof baseInstructions?.text === 'string' ? baseInstructions.text as string : null,
+        cwd: typeof payload.cwd === 'string' ? payload.cwd : null,
+        cliVersion: typeof payload.cli_version === 'string' ? payload.cli_version : null,
+        originator: typeof payload.originator === 'string' ? payload.originator : null,
       };
+      if (isDebugDumpEnabled()) {
+        dumpSummary({ type: 'session_meta', ...record });
+      }
       return;
     }
   }
@@ -467,23 +580,87 @@ function ingestLine(state: TailState, line: string): void {
   if (!payload) return;
   const payloadType = typeof payload.type === 'string' ? payload.type : null;
 
-  // Enrich header with model from turn_context (session_meta often omits it)
-  if (type === 'turn_context' && state.header && !state.header.model) {
+  // Capture turn_context — rich metadata about the current turn
+  if (type === 'turn_context') {
     const model = typeof payload.model === 'string' ? payload.model : null;
-    if (model) {
-      (state.header as { model: string | null }).model = model;
+    if (state.header && !state.header.model && model) {
+      state.header.model = model;
+    }
+    const collabMode = payload.collaboration_mode as Record<string, unknown> | undefined;
+    state.turnContext = {
+      turnId: typeof payload.turn_id === 'string' ? payload.turn_id : null,
+      traceId: typeof payload.trace_id === 'string' ? payload.trace_id : null,
+      cwd: typeof payload.cwd === 'string' ? payload.cwd : null,
+      model,
+      personality: typeof payload.personality === 'string' ? payload.personality : null,
+      effort: typeof payload.effort === 'string' ? payload.effort : null,
+      collaborationMode: typeof collabMode?.mode === 'string' ? collabMode.mode as string : null,
+      approvalPolicy: typeof payload.approval_policy === 'string' ? payload.approval_policy : null,
+      sandboxPolicy: stringifyUnknown(payload.sandbox_policy),
+      timezone: typeof payload.timezone === 'string' ? payload.timezone : null,
+      realtimeActive: typeof payload.realtime_active === 'boolean' ? payload.realtime_active : null,
+      truncationPolicy: stringifyUnknown(payload.truncation_policy),
+    };
+    return;
+  }
+
+  // Capture response_item messages — developer instructions, environment context, assistant responses
+  if (type === 'response_item' && payloadType === 'message') {
+    const role = typeof payload.role === 'string' ? payload.role : null;
+    const contentParts = payload.content;
+
+    if (role === 'developer' && Array.isArray(contentParts)) {
+      const devText = contentParts
+        .map((part: Record<string, unknown>) => typeof part.text === 'string' ? part.text : '')
+        .filter((s: string) => s.length > 0)
+        .join('\n---\n');
+      if (devText) state.developerMessages = devText;
+      return;
+    }
+
+    if (role === 'user' && Array.isArray(contentParts)) {
+      const userText = contentParts
+        .map((part: Record<string, unknown>) => typeof part.text === 'string' ? part.text : '')
+        .filter((s: string) => s.length > 0)
+        .join('\n');
+      if (userText.includes('<environment_context>')) {
+        state.environmentContext = userText;
+      }
+      return;
+    }
+
+    // response_item with role=assistant — capture phase
+    if (role === 'assistant') {
+      const phase = typeof payload.phase === 'string' ? payload.phase : null;
+      const text = Array.isArray(contentParts)
+        ? contentParts
+            .map((part: Record<string, unknown>) => typeof part.text === 'string' ? part.text : '')
+            .filter((s: string) => s.length > 0)
+            .join('\n')
+        : null;
+      if (text) enqueue(state, {
+        requestType: 'chat',
+        prompt: null,
+        completion: null,
+        toolName: null,
+        toolCallArguments: null,
+        toolCallResult: null,
+        phase,
+      });
+      return;
     }
     return;
   }
 
-  // Codex wraps user/agent events inside `event_msg` records.
-  if (type !== 'event_msg' && type !== 'response_item' && type !== 'rollout_item') return;
+  // Capture task lifecycle events
+  if (payloadType === 'task_started') {
+    state.taskStartedAt = asInt(payload.started_at);
+    state.modelContextWindow = asInt(payload.model_context_window);
+    state.collaborationModeKind = typeof payload.collaboration_mode_kind === 'string' ? payload.collaboration_mode_kind : null;
 
-  if (payloadType === 'user_message') {
-    const text = extractText(payload, ['content', 'message', 'text']);
-    if (text) enqueue(state, {
-      requestType: 'chat',
-      prompt: text,
+    enqueue(state, {
+      requestType: 'lifecycle',
+      prompt: null,
       completion: null,
       toolName: null,
       toolCallArguments: null,
@@ -492,8 +669,62 @@ function ingestLine(state: TailState, line: string): void {
     return;
   }
 
+  if (payloadType === 'task_complete') {
+    const durationMs = asInt(payload.duration_ms);
+    const lastMsg = typeof payload.last_agent_message === 'string' ? payload.last_agent_message : null;
+
+    state.sequence++;
+    state.pending.push({
+      eventSequence: state.sequence,
+      requestType: 'lifecycle',
+      prompt: null,
+      completion: lastMsg,
+      toolName: null,
+      toolCallArguments: null,
+      toolCallResult: null,
+      deltaInputTokens: null,
+      deltaOutputTokens: null,
+      cumulativeInputTokens: state.cumulativeInputTokens || null,
+      cumulativeOutputTokens: state.cumulativeOutputTokens || null,
+      cumulativeCacheReadTokens: state.cumulativeCacheReadTokens || null,
+      cumulativeReasoningTokens: state.cumulativeReasoningTokens || null,
+      phase: 'task_complete',
+      rateLimits: state.rateLimits ? JSON.stringify(state.rateLimits) : null,
+      taskDurationMs: durationMs,
+      modelContextWindow: state.modelContextWindow,
+      turnContext: state.turnContext ? JSON.stringify(state.turnContext) : null,
+      systemPrompt: null,
+      developerMessages: null,
+      environmentContext: null,
+    });
+    return;
+  }
+
+  // Skip non-event records that aren't handled above
+  if (type !== 'event_msg' && type !== 'rollout_item') return;
+
+  if (payloadType === 'user_message') {
+    const text = extractText(payload, ['content', 'message', 'text']);
+    if (text) {
+      if (state.sessionTitle === null) {
+        const title = makeSessionTitle(text);
+        if (title) state.sessionTitle = title;
+      }
+      enqueue(state, {
+        requestType: 'chat',
+        prompt: text,
+        completion: null,
+        toolName: null,
+        toolCallArguments: null,
+        toolCallResult: null,
+      });
+    }
+    return;
+  }
+
   if (payloadType === 'agent_message') {
     const text = extractText(payload, ['content', 'message', 'text']);
+    const phase = typeof payload.phase === 'string' ? payload.phase : null;
     if (text) enqueue(state, {
       requestType: 'chat',
       prompt: null,
@@ -501,6 +732,7 @@ function ingestLine(state: TailState, line: string): void {
       toolName: null,
       toolCallArguments: null,
       toolCallResult: null,
+      phase,
     });
     return;
   }
@@ -540,6 +772,12 @@ function ingestLine(state: TailState, line: string): void {
     const output = asInt(usage?.output_tokens ?? payload.output_tokens);
     const cacheRead = asInt(usage?.cached_input_tokens ?? payload.cached_input_tokens ?? payload.cache_read_tokens);
     const reasoning = asInt(usage?.reasoning_output_tokens ?? payload.reasoning_tokens ?? payload.reasoning_output_tokens);
+
+    // Capture rate_limits for this token_count event
+    if (payload.rate_limits && typeof payload.rate_limits === 'object') {
+      state.rateLimits = payload.rate_limits as Record<string, unknown>;
+    }
+
     // Codex emits cumulative counts in some modes, deltas in others. Treat
     // monotonic-increasing values as cumulative; reset as delta-only.
     const deltaIn = input !== null
@@ -568,6 +806,14 @@ function ingestLine(state: TailState, line: string): void {
       cumulativeOutputTokens: state.cumulativeOutputTokens,
       cumulativeCacheReadTokens: state.cumulativeCacheReadTokens || null,
       cumulativeReasoningTokens: state.cumulativeReasoningTokens || null,
+      phase: null,
+      rateLimits: state.rateLimits ? JSON.stringify(state.rateLimits) : null,
+      taskDurationMs: null,
+      modelContextWindow: state.modelContextWindow,
+      turnContext: null,
+      systemPrompt: null,
+      developerMessages: null,
+      environmentContext: null,
     });
   }
 }
@@ -575,19 +821,43 @@ function ingestLine(state: TailState, line: string): void {
 type EnqueueInput = Pick<
   RolloutEvent,
   'requestType' | 'prompt' | 'completion' | 'toolName' | 'toolCallArguments' | 'toolCallResult'
->;
+> & { phase?: string | null };
 
 function enqueue(state: TailState, ev: EnqueueInput): void {
+  // Attach system prompt, developer messages, and environment context on the first chat event
+  let sysPrompt: string | null = null;
+  let devMsgs: string | null = null;
+  let envCtx: string | null = null;
+  if (!state.systemPromptSent && ev.requestType === 'chat' && ev.prompt) {
+    sysPrompt = state.header?.systemPrompt ?? null;
+    devMsgs = state.developerMessages;
+    envCtx = state.environmentContext;
+    state.systemPromptSent = true;
+  }
+
   state.sequence++;
   state.pending.push({
     eventSequence: state.sequence,
-    ...ev,
+    requestType: ev.requestType,
+    prompt: ev.prompt,
+    completion: ev.completion,
+    toolName: ev.toolName,
+    toolCallArguments: ev.toolCallArguments,
+    toolCallResult: ev.toolCallResult,
     deltaInputTokens: null,
     deltaOutputTokens: null,
     cumulativeInputTokens: state.cumulativeInputTokens || null,
     cumulativeOutputTokens: state.cumulativeOutputTokens || null,
     cumulativeCacheReadTokens: state.cumulativeCacheReadTokens || null,
     cumulativeReasoningTokens: state.cumulativeReasoningTokens || null,
+    phase: ev.phase ?? null,
+    rateLimits: null,
+    taskDurationMs: null,
+    modelContextWindow: state.modelContextWindow,
+    turnContext: state.turnContext ? JSON.stringify(state.turnContext) : null,
+    systemPrompt: sysPrompt,
+    developerMessages: devMsgs,
+    environmentContext: envCtx,
   });
 }
 
@@ -610,13 +880,14 @@ function flushPending(state: TailState, _reason: string): void {
   for (const ev of state.pending) {
     const payload: Record<string, unknown> = {
       session_id: sessionId,
+      session_title: state.sessionTitle,
       conversation_id: header.sessionId,
       event_sequence: ev.eventSequence,
       model_id: header.model,
       request_type: ev.requestType,
       prompt: ev.prompt,
       completion: ev.completion,
-      system_prompt: null,
+      system_prompt: ev.systemPrompt,
       raw_input_messages: null,
       raw_output_messages: null,
       input_tokens: ev.deltaInputTokens,
@@ -634,6 +905,22 @@ function flushPending(state: TailState, _reason: string): void {
       path: '/v1/responses',
       status_code: 200,
       span_name: 'codex.rollout',
+      // User info
+      user: userName,
+      hostname: require('os').hostname(),
+      platform: process.platform,
+      // Enriched Codex fields
+      phase: ev.phase,
+      rate_limits: ev.rateLimits,
+      task_duration_ms: ev.taskDurationMs,
+      model_context_window: ev.modelContextWindow,
+      turn_context: ev.turnContext,
+      developer_messages: ev.developerMessages,
+      environment_context: ev.environmentContext,
+      cli_version: header.cliVersion,
+      originator: header.originator,
+      codex_cwd: header.cwd,
+      collaboration_mode_kind: state.collaborationModeKind,
     };
     totalEventsEmitted++;
     if (sendFn) sendFn(payload);
