@@ -188,9 +188,9 @@ function configureCodexOtelConfig(port: number, logger: (msg: string) => void): 
 
   if (
     originalContent.includes(`endpoint = "${targetEndpoint}"`) &&
-    originalContent.includes('protocol = "binary"')
+    originalContent.includes('protocol = "json"')
   ) {
-    logger('[codex] OTEL config already points to our endpoint');
+    logger('[codex] OTEL config already points to our endpoint (json protocol)');
     return false;
   }
 
@@ -212,7 +212,7 @@ function replaceOtelBlock(content: string, port: number): string {
     '',
     '[otel.exporter."otlp-http"]',
     `endpoint = "http://127.0.0.1:${port}"`,
-    'protocol = "binary"',
+    'protocol = "json"',
   ];
 
   const stripped = stripOtelBlock(content);
@@ -289,7 +289,7 @@ function verifyWrittenConfig(configFile: string, port: number, logger: (msg: str
     const verify = readFileSync(configFile, 'utf-8');
     const hasOtelHeader = /^\s*\[otel\]\s*$/m.test(verify);
     const hasEndpoint = verify.includes(`endpoint = "http://127.0.0.1:${port}"`);
-    const hasProtocol = verify.includes('protocol = "binary"');
+    const hasProtocol = verify.includes('protocol = "json"');
     const openBrackets = (verify.match(/\[/g) ?? []).length;
     const closeBrackets = (verify.match(/\]/g) ?? []).length;
     if (!hasOtelHeader || !hasEndpoint || !hasProtocol || openBrackets !== closeBrackets) {

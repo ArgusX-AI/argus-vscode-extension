@@ -143,14 +143,28 @@ function createOtlpHandler(logger: (msg: string) => void): http.RequestListener 
         }
         const data = JSON.parse(body) as Record<string, unknown>;
 
+        // Codex's opentelemetry-rust HTTP exporter posts to the configured
+        // endpoint as-is (e.g. "/"), it does NOT append /v1/{signal}. We must
+        // dispatch by inspecting the OTLP body for resourceLogs / resourceSpans
+        // / resourceMetrics. Match path-suffix first as a fast path; fall back
+        // to body-content sniff when the path is just "/" or unknown.
         if (url.includes('/v1/logs')) {
           processOtlpLogs(data, logger);
         } else if (url.includes('/v1/traces')) {
           processOtlpTraces(data, logger);
         } else if (url.includes('/v1/metrics')) {
           processOtlpMetrics(data, logger);
+        } else if (Array.isArray((data as Record<string, unknown>).resourceLogs)) {
+          logger(`[codex:otel:server] Body-routed → logs (url=${url})`);
+          processOtlpLogs(data, logger);
+        } else if (Array.isArray((data as Record<string, unknown>).resourceSpans)) {
+          logger(`[codex:otel:server] Body-routed → traces (url=${url})`);
+          processOtlpTraces(data, logger);
+        } else if (Array.isArray((data as Record<string, unknown>).resourceMetrics)) {
+          logger(`[codex:otel:server] Body-routed → metrics (url=${url})`);
+          processOtlpMetrics(data, logger);
         } else {
-          logger(`[codex:otel:server] Unknown endpoint: ${url}`);
+          logger(`[codex:otel:server] Unknown OTLP shape on ${url} — keys=[${Object.keys(data).slice(0, 8).join(',')}]`);
         }
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
