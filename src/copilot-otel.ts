@@ -16,6 +16,7 @@ import * as zlib from 'zlib';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { getOrDeriveCopilotTitle } from './copilot-session-state';
 
 /** Fixed port for the OTLP HTTP receiver. Copilot Chat defaults to port 4318
  *  (the standard OTLP port) for its `otel.otlpEndpoint` setting. We listen on
@@ -549,6 +550,7 @@ function processLogRecord(record: Record<string, unknown>, logger: (msg: string)
       path: '/chat/completions',
       status_code: 200,
       span_name: eventName,
+      session_title: getOrDeriveCopilotTitle(sessionId, prompt),
     };
     dumpPayload('log', payload);
     if (sendFn) {
@@ -865,6 +867,7 @@ function processFileMetricRecord(record: Record<string, unknown>, logger: (msg: 
     path: '/chat/completions',
     status_code: 200,
     span_name: 'gen_ai.client.token.usage',
+    session_title: getOrDeriveCopilotTitle(sessionId, null),
   };
   dumpPayload('file-metric', filePayload);
   if (sendFn) {

@@ -4,6 +4,7 @@ import * as tls from 'tls';
 import * as stream from 'stream';
 import type { ClientRequest, RequestOptions, IncomingMessage } from 'http';
 import { isOtelCaptureActive } from './copilot-otel';
+import { getOrDeriveCopilotTitle } from './copilot-session-state';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const Module = require('module') as { prototype: { require: (id: string) => unknown } };
@@ -297,14 +298,16 @@ function captureResponse(
 
       // Send all Copilot requests to Argus — let the server decide what to keep
       log(`[capture] ${method} ${hostname}${path} type=${requestType} prompt=${prompt ? 'yes(' + prompt.length + ')' : 'no'} completion=${completion ? 'yes(' + completion.length + ')' : 'no'} status=${res.statusCode}`);
+      const sessionId = `copilot-${new Date().toISOString().slice(0, 10)}`;
       sendToArgus({
-        session_id: `copilot-${new Date().toISOString().slice(0, 10)}`,
+        session_id: sessionId,
         domain: hostname,
         path,
         method,
         request_type: requestType,
         prompt,
         completion,
+        session_title: getOrDeriveCopilotTitle(sessionId, prompt),
         status_code: res.statusCode,
         content_type: contentType,
         duration_ms: durationMs,
@@ -528,14 +531,16 @@ function parseAndSendSocketData(
   totalIntercepted++;
   domainsSeenSet.add(hostname);
 
+  const sessionId = `copilot-${new Date().toISOString().slice(0, 10)}`;
   sendToArgus({
-    session_id: `copilot-${new Date().toISOString().slice(0, 10)}`,
+    session_id: sessionId,
     domain: hostname,
     path,
     method,
     request_type: requestType,
     prompt,
     completion,
+    session_title: getOrDeriveCopilotTitle(sessionId, prompt),
     status_code: statusCode,
     content_type: contentType,
     duration_ms: durationMs,
@@ -785,14 +790,16 @@ export function startIntercepting(
         }
 
         log(`[capture:fetch] ${method} ${hostname}${path} type=${requestType} prompt=${prompt ? 'yes(' + prompt.length + ')' : 'no'} completion=${completion ? 'yes(' + completion.length + ')' : 'no'} status=${response.status}`);
+        const sessionId = `copilot-${new Date().toISOString().slice(0, 10)}`;
         sendToArgus({
-          session_id: `copilot-${new Date().toISOString().slice(0, 10)}`,
+          session_id: sessionId,
           domain: hostname,
           path,
           method,
           request_type: requestType,
           prompt,
           completion,
+          session_title: getOrDeriveCopilotTitle(sessionId, prompt),
           status_code: response.status,
           content_type: contentType,
           duration_ms: durationMs,

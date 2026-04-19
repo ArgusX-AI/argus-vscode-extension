@@ -9,6 +9,7 @@
  * normally and we capture everything.
  */
 import * as vscode from 'vscode';
+import { getOrDeriveCopilotTitle } from './copilot-session-state';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyFn = (...args: any[]) => any;
@@ -254,8 +255,9 @@ function wrapResponse(
             );
 
             if (sendFn) {
+              const sessionId = `copilot-lm-${new Date().toISOString().slice(0, 10)}`;
               sendFn({
-                session_id: `copilot-lm-${new Date().toISOString().slice(0, 10)}`,
+                session_id: sessionId,
                 model_id: modelId,
                 request_type: 'chat',
                 prompt: prompt.slice(0, 50_000),
@@ -266,6 +268,7 @@ function wrapResponse(
                 method: 'POST',
                 path: '/chat/completions',
                 status_code: 200,
+                session_title: getOrDeriveCopilotTitle(sessionId, prompt),
               });
             }
           }

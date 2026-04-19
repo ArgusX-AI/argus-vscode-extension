@@ -4,6 +4,7 @@ import { startDiagnosticsInterception, stopDiagnosticsInterception } from './cop
 import { startLmIntercept, stopLmIntercept } from './copilot-lm-intercept';
 import { startOtelCapture, stopOtelCapture } from './copilot-otel';
 import { fetchCopilotLicense, clearLicenseCache } from './copilot-license';
+import { clearCopilotSessionTitles } from './copilot-session-state';
 
 let active = false;
 
@@ -106,5 +107,6 @@ export async function teardownCopilotCapture(): Promise<void> {
   clearLicenseCache();
   stopDiagnosticsInterception();
   stopIntercepting();
+  clearCopilotSessionTitles();
   active = false;
 }
