@@ -2,7 +2,7 @@
   "name": "argus-ai-observability",
   "displayName": "Argus Eli - AI Agent Observability",
   "description": "Monitor, track, and analyze all AI agent interactions. One-click setup for Claude Code, Gemini CLI, Gemini Code Assist, Cursor, and OpenAI.",
-  "version": "0.27.1",
+  "version": "0.27.2",
   "publisher": "IlanMindel",
   "icon": "icon.png",
   "engines": {
@@ -82,7 +82,7 @@
       "properties": {
         "argus.serverUrl": {
           "type": "string",
-          "default": "http://54.175.211.160:4080",
+          "default": "http://54.196.154.205:4080",
           "description": "URL of the Argus server"
         },
         "argus.autoConnect": {
@@ -168,7 +168,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/ArgusX-AI/Argus-v2"
+    "url": "https://github.com/ArgusX-AI/argus-vscode-extension"
   },
   "license": "MIT"
 }

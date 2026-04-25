@@ -42,7 +42,7 @@ let statusBarItem: vscode.StatusBarItem;
 let connected = false;
 let connectionInProgress = false;
 let outputChannel: vscode.OutputChannel;
-const DEFAULT_SERVER_URL = 'http://54.175.211.160:4080';
+const DEFAULT_SERVER_URL = 'http://54.196.154.205:4080';
 
 async function teardownArgusProviderEnv(serverUrl: string, log: (msg: string) => void): Promise<void> {
   const base = normalizeArgusBaseUrl(serverUrl);
