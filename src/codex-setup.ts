@@ -186,6 +186,14 @@ function configureCodexOtelConfig(port: number, logger: (msg: string) => void): 
 
   const targetEndpoint = `http://127.0.0.1:${port}`;
 
+  // Migration: older Argus versions wrote `exporter = "otlp-http"` as a string
+  // key inside [otel], which conflicts with [otel.exporter."otlp-http"] table
+  // header and breaks Codex's TOML parser. stripOtelBlock handles this
+  // implicitly, but log when we encounter it for diagnostics.
+  if (/^exporter\s*=\s*"otlp-http"/m.test(originalContent)) {
+    logger('[codex] detected stale exporter="otlp-http" key from older Argus — will rewrite');
+  }
+
   if (
     originalContent.includes(`endpoint = "${targetEndpoint}"`) &&
     originalContent.includes('protocol = "json"')
