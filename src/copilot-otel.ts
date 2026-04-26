@@ -357,6 +357,20 @@ function createOtlpHandler(logger: (msg: string) => void): http.RequestListener 
         // Debug dump — write raw + parsed for inspection
         dumpHttp(url, req.headers, raw, decompressed, data);
 
+        // #region agent log
+        debugDumpOtel('http-request', {
+          url,
+          contentType,
+          encoding: encoding || 'none',
+          rawSize: raw.length,
+          decompressedSize: decompressed.length,
+          topLevelKeys: Object.keys(data),
+          hasResourceLogs: !!data.resourceLogs,
+          hasResourceSpans: !!data.resourceSpans,
+          hasResourceMetrics: !!data.resourceMetrics,
+        });
+        // #endregion
+
         if (url.includes('/v1/logs')) {
           processOtlpLogs(data, logger);
         } else if (url.includes('/v1/traces')) {
@@ -422,6 +436,20 @@ async function startOtlpServer(logger: (msg: string) => void): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// Debug dump — writes OTEL data to known path when copilotDebugMode is on
+// ---------------------------------------------------------------------------
+
+const OTEL_DEBUG_FILE = path.join(os.homedir(), 'Desktop', 'argus-copilot-otel-debug.ndjson');
+
+function debugDumpOtel(source: string, data: Record<string, unknown>): void {
+  if (!debugBasePath) return;
+  try {
+    const line = JSON.stringify({ ts: new Date().toISOString(), source, ...data });
+    fs.appendFileSync(OTEL_DEBUG_FILE, line + '\n');
+  } catch { /* best effort */ }
+}
+
+// ---------------------------------------------------------------------------
 // OTLP Log Records — where prompt/response content lives
 // ---------------------------------------------------------------------------
 
@@ -448,6 +476,16 @@ function processLogRecord(record: Record<string, unknown>, logger: (msg: string)
   const a = extractOtlpAttributes(record);
   const body = extractBody(record);
   const eventName = str(a['event.name']) ?? body ?? '';
+
+  // #region agent log
+  debugDumpOtel('log-record', {
+    eventName,
+    attrKeys: Object.keys(a),
+    bodyPreview: body?.slice(0, 200),
+    allAttrs: a,
+    rawRecordKeys: Object.keys(record),
+  });
+  // #endregion
 
   // Extract content fields
   const model = str(a['gen_ai.request.model']) ?? str(a['gen_ai.response.model']);
@@ -575,14 +613,50 @@ function processOtlpTraces(data: Record<string, unknown>, logger: (msg: string) 
       const spans = ss.spans as Array<Record<string, unknown>> | undefined;
       if (!Array.isArray(spans)) continue;
       spanCount += spans.length;
-      // Trace spans contain timing/context but content is in logs.
-      // Process them for trace IDs and duration if needed.
       for (const span of spans) {
         const a = extractOtlpAttributes(span);
         const name = String(span.name ?? '');
         const model = str(a['gen_ai.request.model']);
+
+        // #region agent log
+        debugDumpOtel('trace-span', { name, traceId: span.traceId, attrKeys: Object.keys(a), attrs: a });
+        // #endregion
+
         if (model) {
           logger(`[otel:trace] span="${name}" model=${model} traceId=${span.traceId ?? '-'}`);
+        }
+
+        // H2: Check for content in span attributes (newer Copilot may put it here)
+        const spanPrompt = str(a['copilot_chat.user_request'])
+          ?? str(a['gen_ai.input.messages'])
+          ?? null;
+        const spanCompletion = str(a['copilot_chat.markdown_content'])
+          ?? str(a['gen_ai.output.messages'])
+          ?? null;
+        if (spanPrompt || spanCompletion) {
+          logger(`[otel:trace:content] FOUND content in span! prompt=${spanPrompt?.length ?? 0} completion=${spanCompletion?.length ?? 0}`);
+          processLogRecord({ attributes: span.attributes, body: span.name }, logger);
+        }
+
+        // H2b: Check span events for content (OTLP spans can carry sub-events)
+        const spanEvents = span.events as Array<Record<string, unknown>> | undefined;
+        if (Array.isArray(spanEvents)) {
+          for (const evt of spanEvents) {
+            const evtAttrs = extractOtlpAttributes(evt);
+            // #region agent log
+            debugDumpOtel('trace-span-event', { spanName: name, eventName: evt.name, attrKeys: Object.keys(evtAttrs), attrs: evtAttrs });
+            // #endregion
+            const evtPrompt = str(evtAttrs['copilot_chat.user_request'])
+              ?? str(evtAttrs['gen_ai.input.messages'])
+              ?? null;
+            const evtCompletion = str(evtAttrs['copilot_chat.markdown_content'])
+              ?? str(evtAttrs['gen_ai.output.messages'])
+              ?? null;
+            if (evtPrompt || evtCompletion) {
+              logger(`[otel:trace:event-content] FOUND content in span event! prompt=${evtPrompt?.length ?? 0} completion=${evtCompletion?.length ?? 0}`);
+              processLogRecord({ attributes: evt.attributes, body: evt.name }, logger);
+            }
+          }
         }
       }
     }
@@ -668,13 +742,28 @@ function extractBody(record: Record<string, unknown>): string | null {
 // Content parsing helpers
 // ---------------------------------------------------------------------------
 
+function extractMessageContent(msg: Record<string, unknown>): string | null {
+  if (typeof msg.content === 'string' && msg.content) return msg.content;
+  const parts = msg.parts as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(parts)) {
+    const textParts = parts
+      .filter(p => (!p.type || p.type === 'text') && typeof p.content === 'string')
+      .map(p => p.content as string);
+    if (textParts.length > 0) return textParts.join('\n');
+  }
+  return null;
+}
+
 function extractUserMessageFromJson(raw: string | null): string | null {
   if (!raw) return null;
   try {
-    const messages = JSON.parse(raw) as Array<{ role?: string; content?: string }>;
+    const messages = JSON.parse(raw) as Array<Record<string, unknown>>;
     if (!Array.isArray(messages)) return null;
     for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === 'user' && messages[i].content) return messages[i].content!;
+      if (messages[i].role === 'user') {
+        const content = extractMessageContent(messages[i]);
+        if (content) return content;
+      }
     }
   } catch { /* not JSON */ }
   return null;
@@ -683,10 +772,13 @@ function extractUserMessageFromJson(raw: string | null): string | null {
 function extractAssistantMessageFromJson(raw: string | null): string | null {
   if (!raw) return null;
   try {
-    const messages = JSON.parse(raw) as Array<{ role?: string; content?: string }>;
+    const messages = JSON.parse(raw) as Array<Record<string, unknown>>;
     if (!Array.isArray(messages)) return null;
     for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === 'assistant' && messages[i].content) return messages[i].content!;
+      if (messages[i].role === 'assistant') {
+        const content = extractMessageContent(messages[i]);
+        if (content) return content;
+      }
     }
   } catch { /* not JSON */ }
   return null;
