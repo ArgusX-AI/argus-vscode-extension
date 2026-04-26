@@ -82,7 +82,7 @@
       "properties": {
         "argus.serverUrl": {
           "type": "string",
-          "default": "http://54.196.154.205:4080",
+          "default": "http://54.175.211.160:4080",
           "description": "URL of the Argus server"
         },
         "argus.autoConnect": {

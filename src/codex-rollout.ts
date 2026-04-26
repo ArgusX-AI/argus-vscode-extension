@@ -877,6 +877,43 @@ function flushPending(state: TailState, _reason: string): void {
   }
   const sessionId = `codex-${header.sessionId.slice(0, 8)}`;
 
+  // Consolidate prompt + completion + tokens into the high-token inference
+  // event so the server's `cdxIsMainModel = input_tokens > 500` heuristic
+  // creates a single main turn with all three pieces of data.
+  const promptIdx = state.pending.findIndex(e => e.prompt);
+  const inferIdx = state.pending.findIndex(e => e.requestType === 'inference' && (e.deltaInputTokens ?? 0) > 500);
+  if (promptIdx >= 0 && inferIdx >= 0 && promptIdx !== inferIdx) {
+    const promptEv = state.pending[promptIdx];
+    const inferEv = state.pending[inferIdx];
+    const completionEv = state.pending.find(
+      (e, i) => e.completion && i !== inferIdx && i !== promptIdx
+    );
+
+    state.pending[inferIdx] = {
+      ...inferEv,
+      requestType: 'chat',
+      prompt: promptEv.prompt,
+      completion: completionEv?.completion ?? inferEv.completion,
+      systemPrompt: promptEv.systemPrompt ?? inferEv.systemPrompt,
+      developerMessages: promptEv.developerMessages ?? inferEv.developerMessages,
+      environmentContext: promptEv.environmentContext ?? inferEv.environmentContext,
+      turnContext: promptEv.turnContext ?? inferEv.turnContext,
+    };
+
+    const removeIdxs = new Set([promptIdx]);
+    if (completionEv) {
+      const cIdx = state.pending.indexOf(completionEv);
+      if (cIdx >= 0) removeIdxs.add(cIdx);
+    }
+    state.pending = state.pending.filter((_, i) => !removeIdxs.has(i));
+  }
+
+  state.pending.sort((a, b) => {
+    if (a.prompt && !b.prompt) return -1;
+    if (!a.prompt && b.prompt) return 1;
+    return 0;
+  });
+
   for (const ev of state.pending) {
     const payload: Record<string, unknown> = {
       session_id: sessionId,
