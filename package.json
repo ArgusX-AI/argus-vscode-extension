@@ -2,7 +2,7 @@
   "name": "argus-ai-observability",
   "displayName": "Argus Eli - AI Agent Observability",
   "description": "Monitor, track, and analyze all AI agent interactions. One-click setup for Claude Code, Gemini CLI, Gemini Code Assist, Cursor, and OpenAI.",
-  "version": "0.27.2",
+  "version": "0.27.3",
   "publisher": "IlanMindel",
   "icon": "icon.png",
   "engines": {
@@ -24,7 +24,8 @@
     "cost tracking",
     "Gemini",
     "Google",
-    "Gemini CLI"
+    "Gemini CLI",
+    "Gemini Code Assist"
   ],
   "activationEvents": [
     "onStartupFinished"
@@ -75,6 +76,14 @@
       {
         "command": "argus.openCodexDebugFolder",
         "title": "Argus: Open Codex Debug Folder (Desktop)"
+      },
+      {
+        "command": "argus.geminiCodeAssistStatus",
+        "title": "Argus: Show Gemini Code Assist Capture Status"
+      },
+      {
+        "command": "argus.openGcaDebugFolder",
+        "title": "Argus: Open Gemini Code Assist Debug Folder (Desktop)"
       }
     ],
     "configuration": {
@@ -102,8 +111,13 @@
         },
         "argus.enableGeminiCodeAssist": {
           "type": "boolean",
-          "default": true,
-          "description": "Enable proxy-based observability for Gemini Code Assist"
+          "default": false,
+          "description": "[Disabled in v0.27.3] Gemini Code Assist HTTPS interception — removed due to monkey-patch conflict with Copilot"
+        },
+        "argus.geminiCodeAssistDebugMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "[Disabled in v0.27.3] GCA debug mode — removed due to monkey-patch conflict"
         },
         "argus.enableCopilot": {
           "type": "boolean",

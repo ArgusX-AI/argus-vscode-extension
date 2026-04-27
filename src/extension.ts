@@ -5,7 +5,9 @@ import { URL } from 'url';
 import { configureClaudeHooks, configureClaudeEnvVar, removeClaudeHooksForServer } from './claude-setup';
 import { argusEnvVarMatches, normalizeArgusBaseUrl, removeEnvVarPersistent } from './env-utils';
 import { configureGeminiCliHooks, configureGeminiEnvVar } from './gemini-setup';
-import { detectGeminiCodeAssist } from './gemini-code-assist';
+// GCA intercept REMOVED in v0.27.3 — two independent monkey-patches on https.request
+// caused Copilot capture to break. See Lessons Learned: "NEVER have two modules
+// independently monkey-patch the same Node.js built-in."
 import { setupCopilotCapture, teardownCopilotCapture } from './copilot-setup';
 import { getInterceptStats, sendTestEvent } from './copilot-intercept';
 import { getDiagnosticsStats, probeLmApiTransport } from './copilot-diagnostics';
@@ -114,7 +116,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Create output channel FIRST and log immediately — this is the primary diagnostic
   outputChannel = vscode.window.createOutputChannel('Argus');
-  outputChannel.appendLine(`[Argus] Extension activating... (v0.25.0)`);
+  outputChannel.appendLine(`[Argus] Extension activating... (v0.27.3)`);
   outputChannel.appendLine(`[Argus] VS Code: ${vscode.version}, Node: ${process.version}, Platform: ${process.platform}`);
   outputChannel.appendLine(`[Argus] fetch available: ${typeof globalThis.fetch}, pid: ${process.pid}`);
 
@@ -199,6 +201,14 @@ export function activate(context: vscode.ExtensionContext) {
       outputChannel.appendLine(`\n--- Copilot Status ---\n${lines.join('\n')}\n---`);
       outputChannel.show();
     }),
+    vscode.commands.registerCommand('argus.geminiCodeAssistStatus', () => {
+      outputChannel.appendLine('[Argus] Gemini Code Assist intercept removed in v0.27.3 — caused monkey-patch conflict with Copilot');
+      outputChannel.show();
+    }),
+    vscode.commands.registerCommand('argus.openGcaDebugFolder', () => {
+      outputChannel.appendLine('[Argus] Gemini Code Assist intercept removed in v0.27.3');
+      outputChannel.show();
+    }),
     vscode.commands.registerCommand('argus.probeLmTransport', async () => {
       outputChannel.appendLine('\n--- LM Transport Probe ---');
       outputChannel.show();
@@ -275,6 +285,9 @@ export function activate(context: vscode.ExtensionContext) {
       : '[Argus] Codex capture disabled in settings');
   }
 
+  // Gemini Code Assist capture — DISABLED in v0.27.3 (monkey-patch conflict with Copilot)
+  outputChannel.appendLine('[Argus] Gemini Code Assist intercept disabled in v0.27.3 — use GCA detection only');
+
   // Auto-connect on startup (deferred to not block activation)
   if (config.get<boolean>('autoConnect', true) && serverUrl) {
     // Use setTimeout to defer — ensures activation returns quickly
@@ -325,15 +338,11 @@ async function connectToServer() {
       }
     }
 
-    // 5. Detect Gemini Code Assist
-    const enableGeminiCodeAssist = config.get<boolean>('enableGeminiCodeAssist', true);
-    const geminiCodeAssist = enableGeminiCodeAssist ? detectGeminiCodeAssist() : { installed: false, version: null };
-
-    // 6. Copilot interception was already started in activate() — just check status
+    // 5. Copilot interception was already started in activate() — just check status
     const enableCopilot = config.get<boolean>('enableCopilot', true);
     const copilotConfigured = enableCopilot; // Already set up in activate()
 
-    // 7. Codex capture was already started in activate()
+    // 6. Codex capture was already started in activate()
     const enableCodex2 = config.get<boolean>('enableCodex', true);
     const codexConfigured = enableCodex2;
 
@@ -350,9 +359,6 @@ async function connectToServer() {
     const parts: string[] = [`Argus connected to ${serverUrl}`];
     if (configured.length > 0) {
       parts.push(`Hooks configured: ${configured.join(', ')}`);
-    }
-    if (geminiCodeAssist.installed) {
-      parts.push('Gemini Code Assist detected (proxy observability)');
     }
 
     vscode.window.showInformationMessage(
