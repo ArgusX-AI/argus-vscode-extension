@@ -12,8 +12,16 @@
 import diagnostics_channel from 'node:diagnostics_channel';
 import http2 from 'node:http2';
 import type { ClientHttp2Session, ClientHttp2Stream, IncomingHttpHeaders, IncomingHttpStatusHeader } from 'node:http2';
-import { isCopilotDomain } from './copilot-intercept';
+import { isCopilotDomain, isGcaDomain } from './copilot-intercept';
 import { isOtelCaptureActive } from './copilot-otel';
+
+// #region agent log
+const DEBUG_ENDPOINT_DIAG = 'http://127.0.0.1:7454/ingest/1abbded5-6f7f-436b-8d24-3265310e81fa';
+const DEBUG_SESSION_DIAG = 'f7d88c';
+function debugLogDiag(location: string, message: string, data: Record<string, unknown> = {}): void {
+  fetch(DEBUG_ENDPOINT_DIAG,{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':DEBUG_SESSION_DIAG},body:JSON.stringify({sessionId:DEBUG_SESSION_DIAG,location,message,data,timestamp:Date.now()})}).catch(()=>{});
+}
+// #endregion
 
 const MAX_REQUEST_BODY = 50 * 1024;
 const MAX_RESPONSE_BODY = 100 * 1024;
@@ -68,9 +76,16 @@ export function startDiagnosticsInterception(
         logFn(`[diag:undici] request:create ${method} ${hostname}${path}`);
       }
 
-      if (!hostname || !isCopilotDomain(hostname)) return;
+      // #region agent log
+      if (hostname && isGcaDomain(hostname)) {
+        debugLogDiag('copilot-diagnostics.ts:undici', 'GCA request via undici', {hypothesisId:'H2_UNDICI', hostname, path, method});
+        logFn(`[diag:undici:gca] GCA request: ${method} ${hostname}${path}`);
+      }
+      // #endregion
 
-      logFn(`[diag] Copilot request: ${method} ${hostname}${path}`);
+      if (!hostname || (!isCopilotDomain(hostname) && !isGcaDomain(hostname))) return;
+
+      logFn(`[diag] ${isGcaDomain(hostname) ? 'GCA' : 'Copilot'} request: ${method} ${hostname}${path}`);
       diagInterceptCount++;
 
       requestStates.set(request, {
@@ -178,8 +193,16 @@ export function startDiagnosticsInterception(
     try {
       const msg = message as Record<string, unknown>;
       const req = msg.request as Record<string, unknown> | undefined;
-      const hostname = req?.hostname ?? req?.host ?? 'unknown';
-      logFn(`[diag:http] request.start ${req?.method ?? '?'} ${hostname}${req?.path ?? '/'}`);
+      const hostname = String(req?.hostname ?? req?.host ?? 'unknown');
+      const reqPath = String(req?.path ?? '/');
+      const reqMethod = String(req?.method ?? '?');
+      logFn(`[diag:http] request.start ${reqMethod} ${hostname}${reqPath}`);
+      // #region agent log
+      if (isGcaDomain(hostname)) {
+        debugLogDiag('copilot-diagnostics.ts:httpStart', 'GCA request via http.client diagnostic channel', {hypothesisId:'H4_HTTP', hostname, path: reqPath, method: reqMethod});
+        logFn(`[diag:http:gca] GCA HTTP request: ${reqMethod} ${hostname}${reqPath}`);
+      }
+      // #endregion
     } catch { /* never break */ }
   });
 
@@ -349,6 +372,12 @@ function patchHttp2(logger: (msg: string) => void): void {
 
       if (hostname && isCopilotDomain(hostname)) {
         logger(`[diag:h2] Copilot HTTP/2 session to ${hostname} — wrapping .request()`);
+        wrapHttp2Session(session, hostname, logger);
+      } else if (hostname && isGcaDomain(hostname)) {
+        // #region agent log
+        debugLogDiag('copilot-diagnostics.ts:h2', 'GCA HTTP/2 session detected', {hypothesisId:'H3_H2', hostname});
+        // #endregion
+        logger(`[diag:h2] GCA HTTP/2 session to ${hostname} — wrapping .request()`);
         wrapHttp2Session(session, hostname, logger);
       }
 

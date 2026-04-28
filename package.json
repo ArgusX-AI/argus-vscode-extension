@@ -2,7 +2,7 @@
   "name": "argus-ai-observability",
   "displayName": "Argus Eli - AI Agent Observability",
   "description": "Monitor, track, and analyze all AI agent interactions. One-click setup for Claude Code, Gemini CLI, Gemini Code Assist, Cursor, and OpenAI.",
-  "version": "0.27.3",
+  "version": "0.29.0",
   "publisher": "IlanMindel",
   "icon": "icon.png",
   "engines": {
@@ -112,12 +112,12 @@
         "argus.enableGeminiCodeAssist": {
           "type": "boolean",
           "default": false,
-          "description": "[Disabled in v0.27.3] Gemini Code Assist HTTPS interception — removed due to monkey-patch conflict with Copilot"
+          "description": "Capture Gemini Code Assist prompts/completions (auto-enabled when GCA extension detected)"
         },
         "argus.geminiCodeAssistDebugMode": {
           "type": "boolean",
           "default": false,
-          "description": "[Disabled in v0.27.3] GCA debug mode — removed due to monkey-patch conflict"
+          "description": "[Reserved] GCA debug mode — future use"
         },
         "argus.enableCopilot": {
           "type": "boolean",

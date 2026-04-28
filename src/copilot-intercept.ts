@@ -6,9 +6,6 @@ import type { ClientRequest, RequestOptions, IncomingMessage } from 'http';
 import { isOtelCaptureActive } from './copilot-otel';
 import { getOrDeriveCopilotTitle } from './copilot-session-state';
 
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const Module = require('module') as { prototype: { require: (id: string) => unknown } };
-
 /** Copilot API domains to intercept (exact matches). */
 const COPILOT_DOMAINS = new Set([
   'api.githubcopilot.com',
@@ -18,16 +15,37 @@ const COPILOT_DOMAINS = new Set([
   'api-model-lab.githubcopilot.com',
 ]);
 
+/** Gemini Code Assist domains. */
+const GCA_DOMAINS = new Set([
+  'cloudcode-pa.googleapis.com',
+  'daily-cloudcode-pa.sandbox.googleapis.com',
+  'daily-cloudcode-pa.googleapis.com',
+]);
+
+/** GCA API paths that carry AI content (generate requests). */
+const GCA_CONTENT_PATHS = [
+  '/v1internal:streamGenerateContent',
+  '/v1internal:generateContent',
+];
+
 /** Check if a hostname belongs to a Copilot API domain. */
 export function isCopilotDomain(hostname: string): boolean {
+  if (GCA_DOMAINS.has(hostname)) return false;
   if (COPILOT_DOMAINS.has(hostname)) return true;
-  // Wildcard: any subdomain of githubcopilot.com
   if (hostname.endsWith('.githubcopilot.com')) return true;
-  // Wildcard: any copilot-related githubusercontent.com subdomain
   if (hostname.endsWith('.githubusercontent.com') && hostname.includes('copilot')) return true;
-  // GitHub uploads for copilot attachments
   if (hostname === 'uploads.github.com') return true;
   return false;
+}
+
+/** Check if a hostname belongs to a Gemini Code Assist domain. */
+export function isGcaDomain(hostname: string): boolean {
+  return GCA_DOMAINS.has(hostname);
+}
+
+/** Check if a path carries GCA AI content. */
+function isGcaContentPath(reqPath: string): boolean {
+  return GCA_CONTENT_PATHS.some(p => reqPath.includes(p));
 }
 
 /** Max bytes to capture from request/response bodies. */
@@ -41,7 +59,6 @@ let originalFetch: typeof globalThis.fetch | null = null;
 let originalProtoWrite: typeof http.ClientRequest.prototype.write | null = null;
 let originalProtoEnd: typeof http.ClientRequest.prototype.end | null = null;
 let originalTlsConnect: typeof tls.connect | null = null;
-let originalModuleRequire: ((id: string) => unknown) | null = null;
 let originalDuplexWrite: typeof stream.Duplex.prototype.write | null = null;
 let originalReadablePush: typeof stream.Readable.prototype.push | null = null;
 
@@ -67,6 +84,163 @@ let totalIntercepted = 0;
 let protoFallbackCount = 0;
 let tlsProtoInterceptCount = 0;
 const domainsSeenSet = new Set<string>();
+
+// --- GCA capture state ---
+let gcaCaptureEnabled = false;
+let gcaSessionCounter = 0;
+let gcaLastDate = '';
+let gcaTotalCaptures = 0;
+let gcaCurrentModelConfigId: string | null = null;
+let gcaLastSessionId: string | null = null;
+const gcaModelDisplayNames = new Map<string, string>();
+
+function gcaModelName(): string | null {
+  if (!gcaCurrentModelConfigId) return null;
+  const display = gcaModelDisplayNames.get(gcaCurrentModelConfigId);
+  if (display) return `Gemini ${display}`;
+  return gcaCurrentModelConfigId
+    .replace(/^chat-/, '')
+    .replace(/-paid-tier$/, '')
+    .replace(/-(\d+)-(\d+)-/, '-$1.$2-');
+}
+
+function makeGcaSessionId(): string {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== gcaLastDate) {
+    gcaLastDate = today;
+    gcaSessionCounter = 0;
+  }
+  return `gca-${today}-${gcaSessionCounter++}`;
+}
+
+/** Fire-and-forget POST to Argus for GCA events. */
+function sendGcaToArgus(payload: Record<string, unknown>): void {
+  try {
+    const body = JSON.stringify(payload);
+    const url = new URL(`${serverUrl}/hooks/GeminiCodeAssistRequest`);
+
+    const req = safeHttpRequest({
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? '443' : '80'),
+      path: url.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'X-Argus-User': userName,
+        'X-Argus-Source': 'gemini-code-assist',
+      },
+      timeout: 5000,
+    } as RequestOptions);
+    req.on('response', (res: IncomingMessage) => {
+      res.resume();
+      if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+        log(`[gca:send] Server accepted (${res.statusCode})`);
+      } else if (res.statusCode && res.statusCode >= 400) {
+        log(`[gca:send] Server returned ${res.statusCode}`);
+      }
+    });
+    req.on('error', (err: Error) => {
+      log(`[gca:send] POST failed: ${err.message}`);
+    });
+    req.end(body);
+    log(`[gca:send] Sent GeminiCodeAssistRequest (${payload.request_type})`);
+  } catch (err) {
+    log(`[gca:send] Error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Extract user prompt from Gemini contents array. */
+function extractGcaPrompt(parsed: Record<string, unknown>): string | null {
+  const request = (parsed.request ?? parsed) as Record<string, unknown>;
+  const contents = request.contents as Array<{ role?: string; parts?: Array<{ text?: string }> }> | undefined;
+  if (!Array.isArray(contents)) return null;
+  for (let i = contents.length - 1; i >= 0; i--) {
+    if (contents[i].role === 'user') {
+      const parts = contents[i].parts;
+      if (Array.isArray(parts)) {
+        return parts.map(p => p.text ?? '').filter(Boolean).join('\n') || null;
+      }
+    }
+  }
+  return null;
+}
+
+/** Extract system prompt from Gemini systemInstruction field. */
+function extractGcaSystemPrompt(parsed: Record<string, unknown>): string | null {
+  const request = (parsed.request ?? parsed) as Record<string, unknown>;
+  const instruction = request.systemInstruction as { parts?: Array<{ text?: string }> } | undefined;
+  if (!instruction?.parts) return null;
+  return instruction.parts.map(p => p.text ?? '').filter(Boolean).join('\n') || null;
+}
+
+/** Parse SSE response from GCA and extract completion + metadata. */
+function parseGcaSseResponse(responseBody: string): {
+  completion: string | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
+  finishReason: string | null;
+  modelVersion: string | null;
+  toolCalls: unknown[] | null;
+} {
+  const textParts: string[] = [];
+  let inputTokens: number | null = null;
+  let outputTokens: number | null = null;
+  let totalTokens: number | null = null;
+  let finishReason: string | null = null;
+  let modelVersion: string | null = null;
+  const toolCalls: unknown[] = [];
+
+  for (const line of responseBody.split('\n')) {
+    if (!line.startsWith('data: ')) continue;
+    const data = line.slice(6).trim();
+    if (!data || data === '[DONE]') continue;
+    try {
+      const parsed = JSON.parse(data);
+      const resp = parsed.response ?? parsed;
+      const candidates = resp.candidates as Array<{
+        content?: { parts?: Array<{ text?: string; functionCall?: unknown }> };
+        finishReason?: string;
+      }> | undefined;
+      if (Array.isArray(candidates)) {
+        for (const c of candidates) {
+          if (c.finishReason) finishReason = c.finishReason;
+          if (Array.isArray(c.content?.parts)) {
+            for (const p of c.content!.parts!) {
+              if (p.text) textParts.push(p.text);
+              if (p.functionCall) toolCalls.push(p.functionCall);
+            }
+          }
+        }
+      }
+      const usage = resp.usageMetadata as Record<string, number> | undefined;
+      if (usage) {
+        if (typeof usage.promptTokenCount === 'number') inputTokens = usage.promptTokenCount;
+        if (typeof usage.candidatesTokenCount === 'number') outputTokens = usage.candidatesTokenCount;
+        if (typeof usage.totalTokenCount === 'number') totalTokens = usage.totalTokenCount;
+      }
+      if (resp.modelVersion) modelVersion = resp.modelVersion;
+    } catch { /* skip unparseable SSE */ }
+  }
+  return {
+    completion: textParts.length > 0 ? textParts.join('') : null,
+    inputTokens, outputTokens, totalTokens, finishReason, modelVersion,
+    toolCalls: toolCalls.length > 0 ? toolCalls : null,
+  };
+}
+
+/** Enable GCA capture through the shared interception layer. */
+export function enableGcaCapture(): void {
+  gcaCaptureEnabled = true;
+  log('[gca] Capture enabled through shared interception layer');
+}
+
+/** Disable GCA capture. */
+export function disableGcaCapture(): void {
+  gcaCaptureEnabled = false;
+  log('[gca] Capture disabled');
+}
 
 /**
  * Extract hostname from https.request arguments.
@@ -322,6 +496,143 @@ function captureResponse(
   res.on('error', () => { /* swallow */ });
 }
 
+/**
+ * Capture a GCA request (Gemini format) and its response.
+ * Uses the same per-request write/end wrapping as captureRequest,
+ * but parses Gemini contents format and sends to /hooks/GeminiCodeAssistRequest.
+ */
+function captureGcaHttpRequest(
+  clientReq: ClientRequest,
+  hostname: string,
+  path: string,
+  method: string,
+): void {
+  capturedRequests.add(clientReq);
+  totalIntercepted++;
+  gcaTotalCaptures++;
+  domainsSeenSet.add(hostname);
+  const chunks: Buffer[] = [];
+  let totalSize = 0;
+  const startTime = Date.now();
+
+  const origWrite = clientReq.write;
+  (clientReq as unknown as Record<string, unknown>).write = function (this: ClientRequest, ...args: unknown[]) {
+    const chunk = args[0];
+    if (chunk && totalSize < MAX_REQUEST_BODY) {
+      const buf = Buffer.isBuffer(chunk) ? chunk
+        : typeof chunk === 'string' ? Buffer.from(chunk) : null;
+      if (buf) {
+        chunks.push(buf.subarray(0, MAX_REQUEST_BODY - totalSize));
+        totalSize += buf.length;
+      }
+    }
+    return origWrite.apply(this, args as Parameters<typeof origWrite>);
+  };
+
+  const origEnd = clientReq.end;
+  (clientReq as unknown as Record<string, unknown>).end = function (this: ClientRequest, ...args: unknown[]) {
+    const chunk = args[0];
+    if (chunk && totalSize < MAX_REQUEST_BODY) {
+      const buf = Buffer.isBuffer(chunk) ? chunk
+        : typeof chunk === 'string' ? Buffer.from(chunk) : null;
+      if (buf) {
+        chunks.push(buf.subarray(0, MAX_REQUEST_BODY - totalSize));
+        totalSize += buf.length;
+      }
+    }
+
+    clientReq.once('response', (res: IncomingMessage) => {
+      captureGcaHttpResponse(res, hostname, path, method, chunks, startTime);
+    });
+
+    return origEnd.apply(this, args as Parameters<typeof origEnd>);
+  };
+}
+
+/** Capture a GCA HTTP response and send to Argus. */
+function captureGcaHttpResponse(
+  res: IncomingMessage,
+  hostname: string,
+  path: string,
+  method: string,
+  requestChunks: Buffer[],
+  startTime: number,
+): void {
+  const responseChunks: Buffer[] = [];
+  let responseSize = 0;
+
+  res.on('data', (chunk: Buffer) => {
+    if (responseSize < MAX_RESPONSE_BODY) {
+      responseChunks.push(chunk.subarray(0, MAX_RESPONSE_BODY - responseSize));
+      responseSize += chunk.length;
+    }
+  });
+
+  res.on('end', () => {
+    try {
+      const requestBody = Buffer.concat(requestChunks).toString('utf-8');
+      const responseBody = Buffer.concat(responseChunks).toString('utf-8');
+      const durationMs = Date.now() - startTime;
+      const contentType = res.headers['content-type'] ?? '';
+
+      if (!isGcaContentPath(path)) {
+        log(`[gca:capture] Skipping non-generate path: ${path}`);
+        return;
+      }
+
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(requestBody);
+      } catch {
+        log(`[gca:capture] Failed to parse request body (${requestBody.length} bytes)`);
+        return;
+      }
+
+      const isStreaming = contentType.includes('text/event-stream') || path.includes('stream');
+      const responseData = isStreaming
+        ? parseGcaSseResponse(responseBody)
+        : parseGcaSseResponse(responseBody);
+
+      const prompt = extractGcaPrompt(parsed);
+      const systemPrompt = extractGcaSystemPrompt(parsed);
+      const model = (parsed.model as string) ?? null;
+      const genConfig = parsed.generationConfig as Record<string, unknown> | undefined;
+
+      const sessionId = makeGcaSessionId();
+      const requestType: 'chat' | 'completion' | 'other' = (prompt || systemPrompt) ? 'chat' : 'other';
+
+      log(`[gca:capture] ${method} ${hostname}${path} prompt=${prompt ? 'yes(' + prompt.length + ')' : 'no'} completion=${responseData.completion ? 'yes(' + responseData.completion.length + ')' : 'no'} tokens=${responseData.inputTokens ?? '?'}/${responseData.outputTokens ?? '?'}`);
+
+      sendGcaToArgus({
+        session_id: sessionId,
+        model_id: model ?? responseData.modelVersion,
+        prompt,
+        completion: responseData.completion,
+        system_prompt: systemPrompt,
+        input_tokens: responseData.inputTokens,
+        output_tokens: responseData.outputTokens,
+        total_tokens: responseData.totalTokens,
+        finish_reason: responseData.finishReason,
+        model_version: responseData.modelVersion,
+        temperature: typeof genConfig?.temperature === 'number' ? genConfig.temperature : null,
+        max_output_tokens: typeof genConfig?.maxOutputTokens === 'number' ? genConfig.maxOutputTokens : null,
+        top_p: typeof genConfig?.topP === 'number' ? genConfig.topP : null,
+        duration_ms: durationMs,
+        request_type: requestType,
+        tool_calls: responseData.toolCalls,
+        domain: hostname,
+        path,
+        raw_request: requestBody.slice(0, 5000),
+        raw_response: responseBody.slice(0, 10000),
+      });
+    } catch (err) {
+      log(`[gca:captureResponse] Error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
+
+  res.on('error', () => { /* swallow */ });
+}
+
 /** Convert various body types to a string. */
 function bodyToString(body: unknown, maxLen: number): string {
   if (typeof body === 'string') return body.slice(0, maxLen);
@@ -415,8 +726,8 @@ function getOrCreateSocketState(socket: tls.TLSSocket): SocketCaptureState | nul
   const hostname = socket.servername
     ?? (socket as unknown as Record<string, unknown>)._host as string | undefined
     ?? null;
-  if (!hostname || !isCopilotDomain(hostname)) return null;
-  // Skip sockets already handled by tls.connect or require proxy patches
+  if (!hostname || (!isCopilotDomain(hostname) && !(gcaCaptureEnabled && isGcaDomain(hostname)))) return null;
+  // Skip sockets already handled by tls.connect patches
   if (processedSockets.has(socket)) return null;
   processedSockets.add(socket);
 
@@ -506,19 +817,45 @@ function parseAndSendSocketData(
   const respBodyStart = rawResponse.indexOf('\r\n\r\n');
   const responseBody = respBodyStart >= 0 ? rawResponse.slice(respBodyStart + 4) : '';
 
-  // Determine request type
+  // --- GCA routing: parse using Gemini format ---
+  if (isGcaDomain(hostname) && gcaCaptureEnabled) {
+    if (!isGcaContentPath(path)) return;
+
+    let gcaParsed: Record<string, unknown> = {};
+    try { gcaParsed = JSON.parse(requestBody); } catch { /* not JSON */ }
+    const gcaPrompt = extractGcaPrompt(gcaParsed);
+    const gcaSystem = extractGcaSystemPrompt(gcaParsed);
+    const gcaResp = parseGcaSseResponse(responseBody);
+    const gcaSessionId = makeGcaSessionId();
+
+    log(`[gca:socket] ${method} ${hostname}${path} prompt=${gcaPrompt ? 'yes(' + gcaPrompt.length + ')' : 'no'} completion=${gcaResp.completion ? 'yes(' + gcaResp.completion.length + ')' : 'no'}`);
+
+    sendGcaToArgus({
+      session_id: gcaSessionId,
+      model_id: (gcaParsed.model as string) ?? gcaResp.modelVersion,
+      prompt: gcaPrompt, completion: gcaResp.completion,
+      system_prompt: gcaSystem,
+      input_tokens: gcaResp.inputTokens, output_tokens: gcaResp.outputTokens,
+      total_tokens: gcaResp.totalTokens, finish_reason: gcaResp.finishReason,
+      duration_ms: durationMs, request_type: (gcaPrompt || gcaSystem) ? 'chat' : 'other',
+      tool_calls: gcaResp.toolCalls,
+      domain: hostname, path,
+      raw_request: requestBody.slice(0, 5000), raw_response: responseBody.slice(0, 10000),
+    });
+    return;
+  }
+
+  // --- Copilot routing: parse using OpenAI format ---
   let requestType: 'chat' | 'completion' | 'other' = 'other';
   if (path.includes('/chat/') || path.includes('/threads/')) requestType = 'chat';
   else if (path.includes('/completions') || path.includes('/generate')) requestType = 'completion';
 
-  // Extract prompt from request body
   let prompt: string | null = null;
   try {
     const parsed = JSON.parse(requestBody);
     prompt = extractPrompt(parsed as Record<string, unknown>);
   } catch { /* not JSON or chunked encoding garbles it */ }
 
-  // Extract completion from response body
   let completion: string | null = null;
   if (responseBody.includes('data: ')) {
     completion = extractSseCompletion(responseBody);
@@ -550,6 +887,174 @@ function parseAndSendSocketData(
 }
 
 /**
+ * Tap the stdio streams of a cloudcode_cli duet process to capture GCA prompts/responses.
+ * The binary communicates with the extension host via JSON-RPC over stdin/stdout pipes.
+ */
+function tapCloudcodeStdio(child: { stdout?: NodeJS.ReadableStream | null; stderr?: NodeJS.ReadableStream | null }): void {
+  let stdoutBuf = '';
+  let captureCount = 0;
+
+  if (child.stdout) {
+    child.stdout.on('data', (chunk: Buffer | string) => {
+      try {
+        const data = chunk.toString();
+        stdoutBuf += data;
+
+        // Try to parse JSON messages from the buffer (Content-Length header or newline-delimited JSON)
+        let processed = true;
+        while (processed) {
+          processed = false;
+
+          // Strategy 1: Content-Length header (LSP/JSON-RPC protocol)
+          const clMatch = stdoutBuf.match(/^Content-Length:\s*(\d+)\r?\n\r?\n/);
+          if (clMatch) {
+            const bodyLen = parseInt(clMatch[1]);
+            const headerLen = clMatch[0].length;
+            if (stdoutBuf.length >= headerLen + bodyLen) {
+              const jsonStr = stdoutBuf.slice(headerLen, headerLen + bodyLen);
+              stdoutBuf = stdoutBuf.slice(headerLen + bodyLen);
+              processed = true;
+              processCloudcodeMessage(jsonStr, ++captureCount);
+              continue;
+            }
+            break; // waiting for more data
+          }
+
+          // Strategy 2: Newline-delimited JSON
+          const nlIdx = stdoutBuf.indexOf('\n');
+          if (nlIdx >= 0) {
+            const line = stdoutBuf.slice(0, nlIdx).trim();
+            stdoutBuf = stdoutBuf.slice(nlIdx + 1);
+            processed = true;
+            if (line.startsWith('{')) {
+              processCloudcodeMessage(line, ++captureCount);
+            }
+            continue;
+          }
+
+          // Strategy 3: Check if the buffer itself is a complete JSON object
+          if (stdoutBuf.startsWith('{') && stdoutBuf.endsWith('}')) {
+            const candidate = stdoutBuf;
+            stdoutBuf = '';
+            processed = true;
+            processCloudcodeMessage(candidate, ++captureCount);
+          }
+        }
+      } catch { /* never break stdio */ }
+    });
+
+    log('[gca:stdio] stdout tap installed');
+  }
+
+  if (child.stderr) {
+    child.stderr.on('data', (chunk: Buffer | string) => {
+      const data = chunk.toString().trim();
+      if (data) {
+        log(`[gca:stdio:err] ${data.slice(0, 300)}`);
+      }
+    });
+    log('[gca:stdio] stderr tap installed');
+  }
+}
+
+function processCloudcodeMessage(jsonStr: string, msgNum: number): void {
+  try {
+    const msg = JSON.parse(jsonStr);
+
+    // GCA uses JSON-RPC 2.0 over LSP. Chat responses stream via $/progress notifications
+    // with params.value.chatHistory[{entity:"USER"|"MODEL", markdownText:"..."}].
+    // The "end" kind contains the final complete response.
+    if (msg.method === '$/progress') {
+      const value = msg.params?.value;
+      const kind = value?.kind as string | undefined;
+      const chatHistory = value?.chatHistory as Array<{
+        entity?: string; markdownText?: string; chatSectionId?: string;
+      }> | undefined;
+
+      if (kind === 'end' && Array.isArray(chatHistory) && chatHistory.length > 0) {
+        let prompt: string | null = null;
+        let completion: string | null = null;
+
+        for (const entry of chatHistory) {
+          if (entry.entity === 'USER' && entry.markdownText) {
+            prompt = entry.markdownText;
+          }
+          if ((entry.entity === 'MODEL' || entry.entity === 'SYSTEM') && entry.markdownText) {
+            completion = entry.markdownText;
+          }
+        }
+
+        if (prompt || completion) {
+          const sessionId = makeGcaSessionId();
+          log(`[gca:stdio:capture] Chat #${msgNum}: prompt=${prompt ? 'yes(' + prompt.length + ')' : 'no'} completion=${completion ? 'yes(' + completion.length + ')' : 'no'}`);
+
+          gcaLastSessionId = sessionId;
+          sendGcaToArgus({
+            session_id: sessionId,
+            model_id: gcaModelName(),
+            prompt,
+            completion,
+            system_prompt: null,
+            input_tokens: null,
+            output_tokens: null,
+            total_tokens: null,
+            finish_reason: 'STOP',
+            model_version: null,
+            duration_ms: null,
+            request_type: 'chat',
+            tool_calls: null,
+            domain: 'cloudcode_cli:stdio',
+            path: '/duet:chat',
+            raw_request: null,
+            raw_response: jsonStr.slice(0, 10000),
+          });
+        }
+      }
+      return; // processed $/progress, skip other checks
+    }
+
+    // Also check telemetry events for metadata (model info, token counts, etc.)
+    if (msg.method === 'telemetry/event') {
+      const metadata = msg.params?.metadata as Record<string, string> | undefined;
+      const eventName = msg.params?.event_name as string | undefined;
+
+      if (eventName === 'cloudcode.aipp.languageserver.conversation' && metadata) {
+        const configId = metadata.model_config_id;
+        log(`[gca:stdio:telemetry] model=${configId ?? '?'} tokens_in=${metadata.input_token_count ?? '?'} tokens_out=${metadata.output_token_count ?? '?'} status=${metadata.cloudcode_call_status ?? '?'}`);
+
+        if (configId && configId !== gcaCurrentModelConfigId) {
+          gcaCurrentModelConfigId = configId;
+          log(`[gca:model] Updated model: ${gcaModelName()}`);
+        }
+        if (configId && gcaLastSessionId) {
+          sendGcaToArgus({
+            session_id: gcaLastSessionId,
+            model_id: gcaModelName(),
+            request_type: 'model_update',
+            prompt: null,
+            completion: null,
+          });
+          log(`[gca:model] Sent model update for session ${gcaLastSessionId}: ${gcaModelName()}`);
+        }
+      }
+    }
+
+    // Cache model display names from modelConfigs/list response
+    if (msg.result && typeof msg.result === 'object') {
+      const configs = (msg.result as Record<string, unknown>).modelConfigs;
+      if (Array.isArray(configs)) {
+        for (const cfg of configs) {
+          if (cfg && typeof cfg === 'object' && typeof cfg.id === 'string' && typeof cfg.displayName === 'string') {
+            gcaModelDisplayNames.set(cfg.id, cfg.displayName);
+          }
+        }
+        log(`[gca:model] Cached ${gcaModelDisplayNames.size} model display names`);
+      }
+    }
+  } catch { /* not valid JSON or unexpected structure */ }
+}
+
+/**
  * Start intercepting HTTPS requests to Copilot domains.
  * Must be called after the extension host has loaded Copilot.
  */
@@ -567,60 +1072,6 @@ export function startIntercepting(
   debugMode = debug ?? false;
   // Always log all hostnames for the first 60 seconds to diagnose Copilot traffic
   debugEndTime = Date.now() + 60_000;
-
-  // --- LAYER 0: Patch Module.prototype.require ---
-  // This is the nuclear option. Built-in module properties (https.request, tls.connect)
-  // are non-configurable in Node v22+. But we can intercept require() itself and return
-  // Proxy objects that wrap the built-in modules. When Copilot's SDK does require('tls'),
-  // it gets our Proxy where .connect returns our patched version.
-  const builtInProxies = new Map<string, unknown>();
-  try {
-    originalModuleRequire = Module.prototype.require;
-    const savedRequire = originalModuleRequire;
-
-    Module.prototype.require = function patchedRequire(id: string): unknown {
-      const originalModule = savedRequire.apply(this, [id] as unknown as [string]);
-
-      if (!intercepting && !['https', 'tls', 'http', 'net'].includes(id)) {
-        return originalModule;
-      }
-
-      // Only proxy the modules we need to intercept
-      if (['https', 'tls', 'http', 'net'].includes(id)) {
-        if (!builtInProxies.has(id)) {
-          builtInProxies.set(id, new Proxy(originalModule as object, {
-            get(target: Record<string, unknown>, prop: string) {
-              // Intercept tls.connect — the critical path for Copilot chat
-              if (id === 'tls' && prop === 'connect') {
-                return function patchedTlsConnect(...args: unknown[]) {
-                  const socket = (Reflect.get(target, prop) as Function).apply(target, args) as tls.TLSSocket;
-                  try {
-                    const opts = (typeof args[0] === 'object' && args[0] !== null) ? args[0] as Record<string, unknown> : null;
-                    const hostname = (opts?.host as string) ?? (opts?.servername as string) ?? null;
-                    if (Date.now() < debugEndTime && hostname) {
-                      log(`[debug] tls.connect (via require proxy) → ${hostname}`);
-                    }
-                    if (hostname && isCopilotDomain(hostname)) {
-                      log(`[socket] TLS connection to Copilot domain: ${hostname}`);
-                      wrapCopilotSocket(socket, hostname);
-                    }
-                  } catch { /* don't break TLS */ }
-                  return socket;
-                };
-              }
-              return Reflect.get(target, prop);
-            },
-          }));
-        }
-        return builtInProxies.get(id);
-      }
-
-      return originalModule;
-    };
-    log('[intercept] Module.prototype.require proxy: OK');
-  } catch (err) {
-    log(`[intercept] Module.prototype.require proxy: FAILED (${err instanceof Error ? err.message : String(err)})`);
-  }
 
   // Resolve safe request function based on server URL protocol.
   // Save the original https.request before patching so we can use it for HTTPS
@@ -676,6 +1127,11 @@ export function startIntercepting(
       const method = extractMethod(args);
       log(`[intercept] Copilot request: ${method} ${hostname}${path}`);
       captureRequest(req, hostname, path, method);
+    } else if (hostname && gcaCaptureEnabled && isGcaDomain(hostname)) {
+      const path = extractPath(args);
+      const method = extractMethod(args);
+      log(`[gca:intercept] GCA request: ${method} ${hostname}${path}`);
+      captureGcaHttpRequest(req, hostname, path, method);
     }
     return req;
   };
@@ -697,6 +1153,10 @@ export function startIntercepting(
       const path = extractPath(args);
       log(`[intercept] Copilot GET: ${hostname}${path}`);
       captureRequest(req, hostname, path, 'GET');
+    } else if (hostname && gcaCaptureEnabled && isGcaDomain(hostname)) {
+      const path = extractPath(args);
+      log(`[gca:intercept] GCA GET: ${hostname}${path}`);
+      captureGcaHttpRequest(req, hostname, path, 'GET');
     }
     return req;
   };
@@ -737,11 +1197,12 @@ export function startIntercepting(
         log(`[debug] fetch → ${hostname}${path}`);
       }
 
-      if (!hostname || !isCopilotDomain(hostname)) {
+      if (!hostname || (!isCopilotDomain(hostname) && !(gcaCaptureEnabled && isGcaDomain(hostname)))) {
         return savedFetch(input, init);
       }
 
-      log(`[intercept] Copilot fetch: ${method} ${hostname}${path}`);
+      const isGca = isGcaDomain(hostname);
+      log(`[intercept] ${isGca ? 'GCA' : 'Copilot'} fetch: ${method} ${hostname}${path}`);
 
       // Capture the request body
       const startTime = Date.now();
@@ -766,46 +1227,69 @@ export function startIntercepting(
         const durationMs = Date.now() - startTime;
         const contentType = response.headers.get('content-type') ?? '';
 
-        // Determine request type
-        let requestType: 'chat' | 'completion' | 'other' = 'other';
-        if (path.includes('/chat/') || path.includes('/threads/')) {
-          requestType = 'chat';
-        } else if (path.includes('/completions') || path.includes('/generate')) {
-          requestType = 'completion';
-        }
-
-        // Extract prompt
-        let prompt: string | null = null;
-        try {
-          const parsed = JSON.parse(requestBody);
-          prompt = extractPrompt(parsed as Record<string, unknown>);
-        } catch { /* not JSON */ }
-
-        // Extract completion (with SSE support)
-        let completion: string | null = null;
-        if (contentType.includes('text/event-stream')) {
-          completion = extractSseCompletion(responseBody);
+        if (isGca) {
+          // GCA fetch capture — use Gemini format parsing
+          if (isGcaContentPath(path)) {
+            let gcaParsed: Record<string, unknown> = {};
+            try { gcaParsed = JSON.parse(requestBody); } catch { /* not JSON */ }
+            const gcaPrompt = extractGcaPrompt(gcaParsed);
+            const gcaSystem = extractGcaSystemPrompt(gcaParsed);
+            const gcaResp = parseGcaSseResponse(responseBody);
+            const gcaSessionId = makeGcaSessionId();
+            log(`[gca:fetch] ${method} ${hostname}${path} prompt=${gcaPrompt ? 'yes' : 'no'} completion=${gcaResp.completion ? 'yes' : 'no'}`);
+            sendGcaToArgus({
+              session_id: gcaSessionId,
+              model_id: (gcaParsed.model as string) ?? gcaResp.modelVersion,
+              prompt: gcaPrompt, completion: gcaResp.completion,
+              system_prompt: gcaSystem,
+              input_tokens: gcaResp.inputTokens, output_tokens: gcaResp.outputTokens,
+              total_tokens: gcaResp.totalTokens, finish_reason: gcaResp.finishReason,
+              duration_ms: durationMs, request_type: (gcaPrompt || gcaSystem) ? 'chat' : 'other',
+              tool_calls: gcaResp.toolCalls,
+              domain: hostname, path,
+              raw_request: requestBody.slice(0, 5000), raw_response: responseBody.slice(0, 10000),
+            });
+          }
         } else {
-          completion = extractJsonCompletion(responseBody);
-        }
+          // Copilot fetch capture
+          let requestType: 'chat' | 'completion' | 'other' = 'other';
+          if (path.includes('/chat/') || path.includes('/threads/')) {
+            requestType = 'chat';
+          } else if (path.includes('/completions') || path.includes('/generate')) {
+            requestType = 'completion';
+          }
 
-        log(`[capture:fetch] ${method} ${hostname}${path} type=${requestType} prompt=${prompt ? 'yes(' + prompt.length + ')' : 'no'} completion=${completion ? 'yes(' + completion.length + ')' : 'no'} status=${response.status}`);
-        const sessionId = `copilot-${new Date().toISOString().slice(0, 10)}`;
-        sendToArgus({
-          session_id: sessionId,
-          domain: hostname,
-          path,
-          method,
-          request_type: requestType,
-          prompt,
-          completion,
-          session_title: getOrDeriveCopilotTitle(sessionId, prompt),
-          status_code: response.status,
-          content_type: contentType,
-          duration_ms: durationMs,
-          request_body: requestBody.slice(0, 2000),
-          response_body: responseBody.slice(0, 5000),
-        });
+          let prompt: string | null = null;
+          try {
+            const parsed = JSON.parse(requestBody);
+            prompt = extractPrompt(parsed as Record<string, unknown>);
+          } catch { /* not JSON */ }
+
+          let completion: string | null = null;
+          if (contentType.includes('text/event-stream')) {
+            completion = extractSseCompletion(responseBody);
+          } else {
+            completion = extractJsonCompletion(responseBody);
+          }
+
+          log(`[capture:fetch] ${method} ${hostname}${path} type=${requestType} prompt=${prompt ? 'yes(' + prompt.length + ')' : 'no'} completion=${completion ? 'yes(' + completion.length + ')' : 'no'} status=${response.status}`);
+          const sessionId = `copilot-${new Date().toISOString().slice(0, 10)}`;
+          sendToArgus({
+            session_id: sessionId,
+            domain: hostname,
+            path,
+            method,
+            request_type: requestType,
+            prompt,
+            completion,
+            session_title: getOrDeriveCopilotTitle(sessionId, prompt),
+            status_code: response.status,
+            content_type: contentType,
+            duration_ms: durationMs,
+            request_body: requestBody.slice(0, 2000),
+            response_body: responseBody.slice(0, 5000),
+          });
+        }
       } catch (err) {
         log(`[intercept] Fetch capture error: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -837,6 +1321,12 @@ export function startIntercepting(
           protoFallbackCount++;
           log(`[intercept:proto] Copilot request via prototype (fallback #${protoFallbackCount}): ${reqMethod} ${hostname}${reqPath}`);
           captureRequest(this, hostname, reqPath, reqMethod);
+        } else if (hostname && gcaCaptureEnabled && isGcaDomain(hostname)) {
+          const reqPath = (this as unknown as Record<string, unknown>).path as string ?? '/';
+          const reqMethod = (this as unknown as Record<string, unknown>).method as string ?? 'GET';
+          protoFallbackCount++;
+          log(`[gca:proto] GCA request via prototype (fallback #${protoFallbackCount}): ${reqMethod} ${hostname}${reqPath}`);
+          captureGcaHttpRequest(this, hostname, reqPath, reqMethod);
         }
       } catch { /* don't break anything */ }
     }
@@ -857,6 +1347,12 @@ export function startIntercepting(
           protoFallbackCount++;
           log(`[intercept:proto] Copilot request via prototype (fallback #${protoFallbackCount}): ${reqMethod} ${hostname}${reqPath}`);
           captureRequest(this, hostname, reqPath, reqMethod);
+        } else if (hostname && gcaCaptureEnabled && isGcaDomain(hostname)) {
+          const reqPath = (this as unknown as Record<string, unknown>).path as string ?? '/';
+          const reqMethod = (this as unknown as Record<string, unknown>).method as string ?? 'GET';
+          protoFallbackCount++;
+          log(`[gca:proto] GCA request via prototype (fallback #${protoFallbackCount}): ${reqMethod} ${hostname}${reqPath}`);
+          captureGcaHttpRequest(this, hostname, reqPath, reqMethod);
         }
       } catch { /* don't break anything */ }
     }
@@ -885,12 +1381,21 @@ export function startIntercepting(
       if (hostname && isCopilotDomain(hostname)) {
         log(`[socket] TLS connection to Copilot domain: ${hostname}`);
         wrapCopilotSocket(socket, hostname);
+      } else if (hostname && gcaCaptureEnabled && isGcaDomain(hostname)) {
+        log(`[gca:socket] TLS connection to GCA domain: ${hostname}`);
+        wrapCopilotSocket(socket, hostname);
       }
     } catch { /* don't break TLS connections */ }
     return socket;
   };
   const tlsPatched = safePatch(tls, 'connect', patchedTlsConnect);
   log(`[intercept] tls.connect patch: ${tlsPatched ? 'OK' : 'FAILED'}`);
+
+  // Module.prototype.require Proxy REMOVED — on Node v22, wrapping `tls` module
+  // with a JS Proxy breaks gRPC-node native bindings (GCA agent mode fails).
+  // The stream.Duplex/Readable prototype patches (Layer 7) already handle TLS socket
+  // capture via getOrCreateSocketState, making the Proxy redundant.
+  log(`[intercept] Module.prototype.require proxy: REMOVED (stream patches handle TLS capture, Node ${process.version})`);
 
   // --- LAYER 7: Patch stream.Duplex.prototype.write + stream.Readable.prototype.push ---
   // The Copilot SDK writes raw HTTP/1.1 bytes to TLS sockets. The write() method
@@ -972,6 +1477,36 @@ export function startIntercepting(
     log(`[intercept] stream.Readable.prototype.push patch: FAILED (${err instanceof Error ? err.message : String(err)})`);
   }
 
+  // --- LAYER 8: Patch child_process.spawn to intercept GCA's cloudcode_cli stdio ---
+  // GCA generate requests go through a native binary (cloudcode_cli duet) via stdio pipes,
+  // completely bypassing Node.js HTTP. We intercept the spawn to tap the pipe communication.
+  let spawnPatched = false;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const cp = require('child_process');
+    const origSpawn = cp.spawn;
+
+    const patchedSpawn = function (...args: unknown[]) {
+      const result = origSpawn.apply(cp, args);
+      try {
+        const cmd = String(args[0] ?? '');
+        const spawnArgs = Array.isArray(args[1]) ? args[1].map(String) : [];
+        const isCloudcodeDuet = cmd.includes('cloudcode_cli') && spawnArgs.includes('duet');
+
+        if (isCloudcodeDuet && gcaCaptureEnabled) {
+          log(`[gca:stdio] Detected cloudcode_cli duet spawn — tapping stdio`);
+          tapCloudcodeStdio(result);
+        }
+      } catch { /* never break spawn */ }
+      return result;
+    };
+
+    spawnPatched = safePatch(cp, 'spawn', patchedSpawn);
+    log(`[intercept] child_process.spawn patch: ${spawnPatched ? 'OK' : 'FAILED'}`);
+  } catch (err) {
+    log(`[intercept] child_process.spawn patch: FAILED (${err instanceof Error ? err.message : String(err)})`);
+  }
+
   intercepting = true;
 
   // Enhanced startup diagnostics
@@ -979,16 +1514,20 @@ export function startIntercepting(
   log(`[intercept] Server: ${argusServerUrl}`);
   log(`[intercept] User: ${user}`);
   log(`[intercept] Debug mode: ${debugMode}`);
+  log(`[intercept] Node: ${process.version}`);
   log(`[intercept] globalThis.fetch patched: ${originalFetch !== null}`);
   log(`[intercept] https.request patched: ${originalHttpsRequest !== null}`);
   log(`[intercept] https.get patched: ${originalHttpsGet !== null}`);
   log(`[intercept] ClientRequest.prototype.write patched: ${originalProtoWrite !== null}`);
   log(`[intercept] ClientRequest.prototype.end patched: ${originalProtoEnd !== null}`);
   log(`[intercept] tls.connect patched: ${originalTlsConnect !== null}`);
-  log(`[intercept] Module.prototype.require proxy: ${originalModuleRequire !== null}`);
+  log(`[intercept] Module.prototype.require proxy: REMOVED (breaks gRPC-node on Node v22+)`);
   log(`[intercept] stream.Duplex.prototype.write patched: ${originalDuplexWrite !== null}`);
   log(`[intercept] stream.Readable.prototype.push patched: ${originalReadablePush !== null}`);
-  log(`[intercept] Domains: ${[...COPILOT_DOMAINS].join(', ')} + wildcards`);
+  log(`[intercept] child_process.spawn patched: ${spawnPatched}`);
+  log(`[intercept] GCA capture: ${gcaCaptureEnabled ? 'ENABLED' : 'disabled'}`);
+  log(`[intercept] Copilot domains: ${[...COPILOT_DOMAINS].join(', ')} + wildcards`);
+  log(`[intercept] GCA domains: ${[...GCA_DOMAINS].join(', ')}`);
 
   // Always log all HTTPS hostnames for the first 60 seconds to help diagnose
   // what Copilot actually calls (regardless of debug setting)
@@ -1114,10 +1653,6 @@ export function stopIntercepting(): void {
   if (originalTlsConnect) {
     restore(tls, 'connect', originalTlsConnect);
     originalTlsConnect = null;
-  }
-  if (originalModuleRequire) {
-    Module.prototype.require = originalModuleRequire;
-    originalModuleRequire = null;
   }
   if (originalDuplexWrite) {
     stream.Duplex.prototype.write = originalDuplexWrite;

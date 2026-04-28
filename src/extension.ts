@@ -5,11 +5,11 @@ import { URL } from 'url';
 import { configureClaudeHooks, configureClaudeEnvVar, removeClaudeHooksForServer } from './claude-setup';
 import { argusEnvVarMatches, normalizeArgusBaseUrl, removeEnvVarPersistent } from './env-utils';
 import { configureGeminiCliHooks, configureGeminiEnvVar } from './gemini-setup';
-// GCA intercept REMOVED in v0.27.3 — two independent monkey-patches on https.request
-// caused Copilot capture to break. See Lessons Learned: "NEVER have two modules
-// independently monkey-patch the same Node.js built-in."
+// GCA capture via child_process.spawn stdio interception (v0.29.0).
+// Module.prototype.require Proxy removed to fix gRPC-node breakage on Node v22+.
 import { setupCopilotCapture, teardownCopilotCapture } from './copilot-setup';
-import { getInterceptStats, sendTestEvent } from './copilot-intercept';
+import { getInterceptStats, sendTestEvent, enableGcaCapture, disableGcaCapture } from './copilot-intercept';
+import { detectGeminiCodeAssist } from './gemini-code-assist';
 import { getDiagnosticsStats, probeLmApiTransport } from './copilot-diagnostics';
 import { startLmMonitor, stopLmMonitor, getLmStatus } from './copilot-lm-monitor';
 import { getLmInterceptStats } from './copilot-lm-intercept';
@@ -116,7 +116,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Create output channel FIRST and log immediately — this is the primary diagnostic
   outputChannel = vscode.window.createOutputChannel('Argus');
-  outputChannel.appendLine(`[Argus] Extension activating... (v0.27.3)`);
+  outputChannel.appendLine(`[Argus] Extension activating... (v0.29.0)`);
   outputChannel.appendLine(`[Argus] VS Code: ${vscode.version}, Node: ${process.version}, Platform: ${process.platform}`);
   outputChannel.appendLine(`[Argus] fetch available: ${typeof globalThis.fetch}, pid: ${process.pid}`);
 
@@ -202,11 +202,12 @@ export function activate(context: vscode.ExtensionContext) {
       outputChannel.show();
     }),
     vscode.commands.registerCommand('argus.geminiCodeAssistStatus', () => {
-      outputChannel.appendLine('[Argus] Gemini Code Assist intercept removed in v0.27.3 — caused monkey-patch conflict with Copilot');
+      const gca = detectGeminiCodeAssist();
+      outputChannel.appendLine(`[Argus] GCA: installed=${gca.installed}, version=${gca.version ?? 'unknown'}, capture via shared interception layer`);
       outputChannel.show();
     }),
     vscode.commands.registerCommand('argus.openGcaDebugFolder', () => {
-      outputChannel.appendLine('[Argus] Gemini Code Assist intercept removed in v0.27.3');
+      outputChannel.appendLine('[Argus] Gemini Code Assist debug: reserved for future use');
       outputChannel.show();
     }),
     vscode.commands.registerCommand('argus.probeLmTransport', async () => {
@@ -285,8 +286,16 @@ export function activate(context: vscode.ExtensionContext) {
       : '[Argus] Codex capture disabled in settings');
   }
 
-  // Gemini Code Assist capture — DISABLED in v0.27.3 (monkey-patch conflict with Copilot)
-  outputChannel.appendLine('[Argus] Gemini Code Assist intercept disabled in v0.27.3 — use GCA detection only');
+  // Gemini Code Assist capture — integrated into shared interception layer
+  const enableGca = config.get<boolean>('enableGeminiCodeAssist', false);
+  const gcaStatus = detectGeminiCodeAssist();
+  outputChannel.appendLine(`[Argus] GCA detection: installed=${gcaStatus.installed}, version=${gcaStatus.version ?? 'unknown'}, setting=${enableGca}`);
+  if (gcaStatus.installed && serverUrl) {
+    enableGcaCapture();
+    outputChannel.appendLine('[Argus] GCA capture ENABLED through shared interception layer (v0.28.6)');
+  } else if (!gcaStatus.installed) {
+    outputChannel.appendLine('[Argus] GCA not installed — capture skipped');
+  }
 
   // Auto-connect on startup (deferred to not block activation)
   if (config.get<boolean>('autoConnect', true) && serverUrl) {
@@ -381,6 +390,7 @@ async function connectToServer() {
 
 async function disconnectFromServer() {
   try { stopLmMonitor(); } catch { /* best effort */ }
+  try { disableGcaCapture(); } catch { /* best effort */ }
   try { await teardownCopilotCapture(); } catch { /* best effort */ }
   try { await teardownCodexCapture(); } catch { /* best effort */ }
   const config = vscode.workspace.getConfiguration('argus');
@@ -513,8 +523,15 @@ function updateStatusBar(state: 'connected' | 'disconnected' | 'connecting' | 'e
 
 export async function deactivate() {
   try { stopLmMonitor(); } catch { /* best effort */ }
+  try { disableGcaCapture(); } catch { /* best effort */ }
   try { await teardownCopilotCapture(); } catch { /* best effort */ }
   try { await teardownCodexCapture(); } catch { /* best effort */ }
   try { disableDebugDump(); } catch { /* best effort */ }
+  try {
+    const serverUrl = getConfiguredServerUrl();
+    if (serverUrl) {
+      await teardownArgusProviderEnv(serverUrl, (msg) => console.log(msg));
+    }
+  } catch { /* best effort */ }
   statusBarItem?.dispose();
 }
