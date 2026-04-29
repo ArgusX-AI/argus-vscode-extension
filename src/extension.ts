@@ -3,6 +3,7 @@ import * as http from 'http';
 import * as https from 'https';
 import { URL } from 'url';
 import { configureClaudeHooks, configureClaudeEnvVar, removeClaudeHooksForServer } from './claude-setup';
+import { configureCursorHooks, removeCursorHooksForServer } from './cursor-setup';
 import { argusEnvVarMatches, normalizeArgusBaseUrl, removeEnvVarPersistent } from './env-utils';
 import { configureGeminiCliHooks, configureGeminiEnvVar } from './gemini-setup';
 // GCA capture via child_process.spawn stdio interception (v0.29.0).
@@ -55,6 +56,13 @@ async function teardownArgusProviderEnv(serverUrl: string, log: (msg: string) =>
     }
   } catch (e) {
     log(`[Argus] Claude hook cleanup error: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  try {
+    if (removeCursorHooksForServer(base)) {
+      log(`[Argus] Removed Cursor hooks for ${base}`);
+    }
+  } catch (e) {
+    log(`[Argus] Cursor hook cleanup error: ${e instanceof Error ? e.message : String(e)}`);
   }
   if (argusEnvVarMatches('ANTHROPIC_BASE_URL', base)) {
     await removeEnvVarPersistent('ANTHROPIC_BASE_URL');
@@ -116,7 +124,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Create output channel FIRST and log immediately — this is the primary diagnostic
   outputChannel = vscode.window.createOutputChannel('Argus');
-  outputChannel.appendLine(`[Argus] Extension activating... (v0.29.0)`);
+  outputChannel.appendLine(`[Argus] Extension activating... (v0.30.0)`);
   outputChannel.appendLine(`[Argus] VS Code: ${vscode.version}, Node: ${process.version}, Platform: ${process.platform}`);
   outputChannel.appendLine(`[Argus] fetch available: ${typeof globalThis.fetch}, pid: ${process.pid}`);
 
@@ -347,11 +355,22 @@ async function connectToServer() {
       }
     }
 
-    // 5. Copilot interception was already started in activate() — just check status
+    // 5. Configure Cursor hooks (non-fatal)
+    let cursorConfigured = false;
+    const enableCursor = config.get<boolean>('enableCursor', true);
+    if (enableCursor) {
+      try {
+        cursorConfigured = await configureCursorHooks(serverUrl);
+      } catch (cursorErr) {
+        console.log('[Argus] Cursor hooks setup skipped:', cursorErr);
+      }
+    }
+
+    // 6. Copilot interception was already started in activate() — just check status
     const enableCopilot = config.get<boolean>('enableCopilot', true);
     const copilotConfigured = enableCopilot; // Already set up in activate()
 
-    // 6. Codex capture was already started in activate()
+    // 7. Codex capture was already started in activate()
     const enableCodex2 = config.get<boolean>('enableCodex', true);
     const codexConfigured = enableCodex2;
 
@@ -362,6 +381,7 @@ async function connectToServer() {
     const configured: string[] = [];
     if (claudeConfigured) { configured.push('Claude Code'); }
     if (geminiCliConfigured) { configured.push('Gemini CLI'); }
+    if (cursorConfigured) { configured.push('Cursor'); }
     if (copilotConfigured) { configured.push('GitHub Copilot'); }
     if (codexConfigured) { configured.push('OpenAI Codex'); }
 
